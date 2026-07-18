@@ -1,0 +1,32 @@
+# API 密钥配置
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 运行日志
+logs/
+conversation_logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 工作目录
+workspace/
+
+# 批量翻译输出
+target_output/
+target_space/
+
+# 对话持久化数据
+.persist/
+
+# 系统文件
+Thumbs.db
+.DS_Store
