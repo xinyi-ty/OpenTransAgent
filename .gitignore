@@ -17,9 +17,6 @@ conversation_logs/
 .vscode/
 *.swp
 
-# 工作目录
-workspace/
-
 # 批量翻译输出
 target_output/
 target_space/
