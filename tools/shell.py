@@ -26,7 +26,8 @@ class ExecuteCommandExecutor(ToolExecutor):
     def __call__(self, action, conversation=None):
         timeout = action.timeout or self.default_timeout
         try:
-            result = subprocess.run(action.command, shell=True, capture_output=True, text=True,
+            result = subprocess.run(action.command, shell=True, capture_output=True,
+                                    encoding='utf-8', errors='replace',
                                     cwd=self.working_dir, timeout=timeout)
             output = f"$ {action.command}\n"
             if result.stdout: output += result.stdout[:3000]

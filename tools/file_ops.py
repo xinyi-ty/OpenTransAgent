@@ -1,11 +1,12 @@
 """文件读写工具：read_file, create_file"""
 
+from __future__ import annotations
+
 from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
-from openhands.sdk.llm import TextContent
 from pydantic import Field
 
-# ── 依赖层访问控制（模块级，避免存入 Pydantic 模型导致序列化失败）──
+# ── 依赖层控制（仅用于 create_file，read_file 靠物理隔离）──
 _LAYER_CTRL = None
 
 
@@ -16,6 +17,12 @@ def set_layer_ctrl(ctrl):
 
 def _get_layer_ctrl():
     return _LAYER_CTRL
+
+
+def _resolve_path(root: Path, filepath: str) -> Path:
+    """将文件路径解析为相对于工作区根的绝对路径。"""
+    p = Path(filepath)
+    return (root / p).resolve() if not p.is_absolute() else p.resolve()
 
 
 class ReadFileAction(Action):
@@ -32,31 +39,23 @@ class ReadFileExecutor(ToolExecutor):
         self.root = Path(workspace_root).resolve()
 
     def __call__(self, action, conversation=None):
-        p = Path(action.filepath)
-        if not p.is_absolute():
-            p = self.root / p
-        p = p.resolve()
-
-        # 依赖层访问控制（从模块级变量读取，避免序列化问题）
-        ctrl = _get_layer_ctrl()
-        if ctrl and ctrl.active:
-            try:
-                rel = str(p.relative_to(self.root).as_posix())
-            except ValueError:
-                rel = action.filepath
-            if not ctrl.is_unlocked(rel):
-                return ReadFileObservation.from_text(
-                    text=f"⛕ '{rel}' 属于更高依赖层，当前不可读。"
-                         f"完成当前层所有文件并通过测试后将自动解锁。",
-                    is_error=True, result="", filepath=action.filepath)
-
+        p = _resolve_path(self.root, action.filepath)
         if not p.exists():
-            return ReadFileObservation.from_text(text=f"文件不存在: {action.filepath}", is_error=True, result="", filepath=action.filepath)
+            return ReadFileObservation.from_text(
+                text=f"文件不存在: {action.filepath}", is_error=True,
+                result="", filepath=action.filepath,
+            )
         try:
             content = p.read_text(encoding="utf-8")
-            return ReadFileObservation.from_text(text=f"📄 {action.filepath}\n\n{content[:5000]}", result=content, filepath=action.filepath)
+            return ReadFileObservation.from_text(
+                text=f"📄 {action.filepath}\n\n{content[:5000]}",
+                result=content, filepath=action.filepath,
+            )
         except Exception as e:
-            return ReadFileObservation.from_text(text=f"读取失败: {e}", is_error=True, result="", filepath=action.filepath)
+            return ReadFileObservation.from_text(
+                text=f"读取失败: {e}", is_error=True,
+                result="", filepath=action.filepath,
+            )
 
 
 class ReadFileTool(ToolDefinition):
@@ -86,12 +85,9 @@ class CreateFileExecutor(ToolExecutor):
         self.root = Path(workspace_root).resolve()
 
     def __call__(self, action, conversation=None):
-        p = Path(action.filepath)
-        if not p.is_absolute():
-            p = self.root / p
-        p = p.resolve()
+        p = _resolve_path(self.root, action.filepath)
 
-        # 依赖层访问控制（与 read_file 一致）
+        # 层检查：不能提前创建高层的文件
         ctrl = _get_layer_ctrl()
         if ctrl and ctrl.active:
             try:
@@ -101,7 +97,7 @@ class CreateFileExecutor(ToolExecutor):
             if not ctrl.is_unlocked(rel):
                 return CreateFileObservation.from_text(
                     text=f"⛕ '{rel}' 属于更高依赖层，当前不可创建。"
-                         f"完成当前层所有文件并通过测试后将自动解锁。",
+                         f"先完成当前层所有文件并通过测试。",
                     is_error=True, path=action.filepath, size=0)
 
         try:
@@ -121,3 +117,68 @@ class CreateFileTool(ToolDefinition):
 
 
 register_tool("create_file", CreateFileTool)
+
+
+# ── list_files ──────────────────────────────────────────────────
+
+
+class ListFilesAction(Action):
+    path: str = Field(default=".", description="要列出的目录路径（相对于工作区根）")
+
+
+class ListFilesObservation(Observation):
+    files: list[str] = Field(default_factory=list)
+    dirs: list[str] = Field(default_factory=list)
+    count: int = Field(default=0)
+
+
+class ListFilesExecutor(ToolExecutor):
+    def __init__(self, workspace_root: str = "."):
+        self.root = Path(workspace_root).resolve()
+
+    def __call__(self, action, conversation=None):
+        target = self.root
+        if action.path and action.path != ".":
+            p = Path(action.path)
+            target = (self.root / p).resolve() if not p.is_absolute() else p.resolve()
+        if not target.exists() or not target.is_dir():
+            return ListFilesObservation.from_text(
+                text=f"目录不存在: {action.path}", is_error=True,
+            )
+        files, dirs = [], []
+        try:
+            for entry in sorted(target.iterdir(), key=lambda x: x.name):
+                rel = str(entry.relative_to(self.root).as_posix())
+                if entry.is_dir():
+                    dirs.append(rel + "/")
+                else:
+                    files.append(rel)
+        except Exception as e:
+            return ListFilesObservation.from_text(
+                text=f"列出目录失败: {e}", is_error=True,
+            )
+        text = f"📁 {action.path}/  ({len(files)} files, {len(dirs)} subdirs)\n"
+        if dirs:
+            text += "\n  📂 " + "\n  📂 ".join(dirs)
+        if files:
+            text += "\n  📄 " + "\n  📄 ".join(files)
+        return ListFilesObservation.from_text(
+            text=text, files=files, dirs=dirs,
+            count=len(files) + len(dirs),
+        )
+
+
+class ListFilesTool(ToolDefinition):
+    description: str = "列出工作区目录下的文件和子目录（不递归）"
+    @classmethod
+    def create(cls, conv_state=None, **kwargs):
+        return [cls(
+            action_type=ListFilesAction,
+            observation_type=ListFilesObservation,
+            executor=ListFilesExecutor(
+                workspace_root=kwargs.get("workspace_root", "."),
+            ),
+        )]
+
+
+register_tool("list_files", ListFilesTool)

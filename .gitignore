@@ -27,3 +27,8 @@ target_space/
 # 系统文件
 Thumbs.db
 .DS_Store
+
+# 虚拟环境
+.venv/
+
+nul

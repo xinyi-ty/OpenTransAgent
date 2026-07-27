@@ -30,14 +30,15 @@ def suppress_sdk_logging():
     logging.getLogger("openhands").setLevel(logging.WARNING)
     logging.getLogger().addFilter(OpenhandsFilter())
 
-    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("LiteLLM").setLevel(logging.ERROR)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger().setLevel(logging.WARNING)
 
-    # 屏蔽 LiteLLM 成本计算失败的警告（自定义模型 + 代理时常见）
+    # 屏蔽第三方库的弃用警告
     warnings.filterwarnings("ignore", message="Cost calculation failed")
+    warnings.filterwarnings("ignore", module="fastapi")
 
 
 def setup_log_dir(model: str, project_name: str,

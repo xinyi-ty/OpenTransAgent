@@ -5,30 +5,6 @@ from pathlib import Path
 from typing import Callable
 
 
-def run_precheck(workspace_path: str, target_language: str, project_name: str) -> list[str]:
-    """在 workspace 中生成目标语言所需的构建配置文件（如已存在则跳过）。"""
-    path = Path(workspace_path).resolve()
-    normalized = _normalize_language(target_language)
-    report: list[str] = []
-
-    handler_map: dict[str, Callable] = {
-        "cpp": _precheck_cpp,
-        "python": _precheck_python,
-        "java": _precheck_java,
-        "rust": _precheck_rust,
-        "go": _precheck_go,
-        "csharp": _precheck_csharp,
-        "javascript": _precheck_javascript,
-    }
-
-    handler = handler_map.get(normalized)
-    if handler:
-        report.extend(handler(path, project_name))
-    else:
-        report.append(f"[Precheck] 未支持的语言: {target_language}，跳过脚手架生成")
-    return report
-
-
 def _normalize_language(language: str) -> str:
     raw = language.strip().lower()
     aliases = {"c++": "cpp", "cplusplus": "cpp", "c#": "csharp", "cs": "csharp", "golang": "go", "js": "javascript"}
@@ -52,15 +28,52 @@ def _ensure(path: Path, content: str, report: list[str]):
 
 def _precheck_cpp(path: Path, name: str) -> list[str]:
     r = []
-    safe = _sanitize_name(name)
+    safe = _sanitize_name(name, "translated")
+
+    # 收集已有的测试源文件
+    test_files = []
+    for d in ["public_tests", "tests", "test"]:
+        test_dir = path / d
+        if test_dir.exists():
+            for ext in ("*.cpp", "*.cxx"):
+                for f in sorted(test_dir.rglob(ext)):
+                    test_files.append(str(f.relative_to(path).as_posix()))
+
     cmake = path / "CMakeLists.txt"
     if not cmake.exists() and not (path / "Makefile").exists():
-        _ensure(cmake, (
-            f"cmake_minimum_required(VERSION 3.16)\n"
-            f"project({safe} LANGUAGES CXX)\n"
-            f"set(CMAKE_CXX_STANDARD 17)\n"
-            f"add_executable(${{PROJECT_NAME}} main.cpp)\n"
-        ), r)
+        lines = [
+            f"cmake_minimum_required(VERSION 3.16)",
+            f"project({safe} LANGUAGES CXX)",
+            f"set(CMAKE_CXX_STANDARD 17)",
+            f"set(CMAKE_CXX_STANDARD_REQUIRED ON)",
+            f"",
+            f"# Auto-discover translated source files",
+            f"file(GLOB_RECURSE SOURCES \"*.cpp\" \"*.cxx\")",
+            f"add_library(translated_lib ${{SOURCES}})",
+            f"",
+            f"# Google Test — 优先找本地安装，找不到再从 GitHub 下载",
+            f"find_package(GTest QUIET)",
+            f"if(NOT GTest_FOUND)",
+            f"    include(FetchContent)",
+            f"    FetchContent_Declare(",
+            f"        googletest",
+            f"        GIT_REPOSITORY https://github.com/google/googletest.git",
+            f"        GIT_TAG release-1.12.1",
+            f"    )",
+            f"    FetchContent_MakeAvailable(googletest)",
+            f"endif()",
+            f"enable_testing()",
+        ]
+        if test_files:
+            lines.append(f"")
+            lines.append(f"# Per-file test executables (each compiles independently)")
+            for tf in test_files:
+                test_name = Path(tf).stem
+                lines.append(f"add_executable({test_name} {tf})")
+                lines.append(f"target_include_directories({test_name} PRIVATE ${{CMAKE_SOURCE_DIR}})")
+                lines.append(f"target_link_libraries({test_name} translated_lib GTest::gtest_main)")
+                lines.append(f"")
+        _ensure(cmake, "\n".join(lines), r)
     _ensure(path / "src/.gitkeep", "", r)
     if not r:
         r.append("  [Precheck] CMakeLists.txt 已存在")
@@ -180,3 +193,31 @@ def _precheck_javascript(path: Path, name: str) -> list[str]:
     if not r:
         r.append("  [Precheck] package.json 已存在")
     return r
+
+
+# ═══════════════════════════════════════════════════════════════
+#  分发入口
+# ═══════════════════════════════════════════════════════════════
+
+_PRECHECK_HANDLERS: dict[str, Callable[..., list[str]]] = {
+    "cpp": _precheck_cpp,
+    "python": _precheck_python,
+    "java": _precheck_java,
+    "rust": _precheck_rust,
+    "go": _precheck_go,
+    "csharp": _precheck_csharp,
+    "javascript": _precheck_javascript,
+}
+
+
+def run_precheck(workspace_path: str, target_language: str, project_name: str) -> list[str]:
+    """在 workspace 中生成目标语言所需的构建配置文件（如已存在则跳过）。"""
+    path = Path(workspace_path).resolve()
+    normalized = _normalize_language(target_language)
+    report: list[str] = []
+    handler = _PRECHECK_HANDLERS.get(normalized)
+    if handler:
+        report.extend(handler(path, project_name))
+    else:
+        report.append(f"[Precheck] 未支持的语言: {target_language}，跳过脚手架生成")
+    return report

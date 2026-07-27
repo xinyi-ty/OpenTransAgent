@@ -1,52 +1,46 @@
-"""语言配置：每种语言的源文件扩展名和目标文件扩展名。"""
+"""语言配置：每种语言作为源语言时的扫描扩展名，以及作为目标语言时的提取扩展名。"""
 
-LANGUAGE_CONFIG = {
+LANGUAGE_CONFIG: dict[str, dict[str, list[str]]] = {
     "python": {
-        "source": [".py"],
-        "target": [".py"],
+        "source_exts": [".py"],
+        "target_exts": [".py"],
     },
     "cpp": {
-        "source": [".cpp", ".cxx", ".cc", ".h", ".hpp", ".hxx"],
-        "target": [".cpp", ".h", ".hpp"],
+        "source_exts": [".cpp", ".cxx", ".cc", ".h", ".hpp", ".hxx"],
+        "target_exts": [".cpp", ".h", ".hpp"],
     },
     "c": {
-        "source": [".c", ".h"],
-        "target": [".c", ".h"],
+        "source_exts": [".c", ".h"],
+        "target_exts": [".c", ".h"],
     },
     "java": {
-        "source": [".java"],
-        "target": [".java"],
+        "source_exts": [".java"],
+        "target_exts": [".java"],
     },
     "csharp": {
-        "source": [".cs"],
-        "target": [".cs"],
+        "source_exts": [".cs"],
+        "target_exts": [".cs"],
     },
     "go": {
-        "source": [".go"],
-        "target": [".go"],
+        "source_exts": [".go"],
+        "target_exts": [".go"],
     },
     "rust": {
-        "source": [".rs"],
-        "target": [".rs"],
+        "source_exts": [".rs"],
+        "target_exts": [".rs"],
     },
     "javascript": {
-        "source": [".js", ".jsx"],
-        "target": [".js", ".jsx"],
+        "source_exts": [".js", ".jsx"],
+        "target_exts": [".js", ".jsx"],
     },
     "typescript": {
-        "source": [".ts", ".tsx"],
-        "target": [".ts", ".tsx"],
+        "source_exts": [".ts", ".tsx"],
+        "target_exts": [".ts", ".tsx"],
     },
 }
 
 
-def get_source_extensions(language: str) -> list[str]:
-    """获取源语言的扫描扩展名。"""
-    cfg = LANGUAGE_CONFIG.get(language.lower())
-    return cfg["source"] if cfg else [f".{language}"]
-
-
 def get_target_extensions(language: str) -> list[str]:
-    """获取目标语言的结果提取扩展名。"""
+    """获取目标语言的结果提取扩展名（用于 extract_results 筛选文件）。"""
     cfg = LANGUAGE_CONFIG.get(language.lower())
-    return cfg["target"] if cfg else [f".{language}"]
+    return cfg["target_exts"] if cfg else [f".{language}"]

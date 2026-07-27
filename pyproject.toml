@@ -1,0 +1,12 @@
+[project]
+name = "opentrans-agent"
+version = "0.1.0"
+description = "基于 OpenHands SDK 的仓库级代码翻译 Agent"
+requires-python = ">=3.12"
+dependencies = [
+    "openhands-sdk>=1.33",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+opentrans = "run:main"

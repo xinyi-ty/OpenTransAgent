@@ -1,5 +1,7 @@
 """内容搜索工具：search_content"""
 
+from __future__ import annotations
+
 from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
 from pydantic import Field
@@ -17,10 +19,17 @@ class SearchContentObservation(Observation):
 
 
 class SearchContentExecutor(ToolExecutor):
-    def __init__(self, workspace_root: str = ".", max_results: int = 10, extensions: tuple = None):
+    def __init__(
+        self,
+        workspace_root: str = ".",
+        max_results: int = 10,
+        extensions: tuple[str, ...] | None = None,
+    ):
         self.root = Path(workspace_root).resolve()
         self.max_results = max_results
-        self.extensions = extensions or (".py", ".java", ".cpp", ".h", ".cs", ".rs", ".go", ".js", ".ts")
+        self.extensions = extensions or (
+            ".py", ".java", ".cpp", ".h", ".cs", ".rs", ".go", ".js", ".ts",
+        )
 
     def __call__(self, action, conversation=None):
         root = self.root
@@ -32,7 +41,7 @@ class SearchContentExecutor(ToolExecutor):
             if not f.is_file() or f.suffix.lower() not in self.extensions:
                 continue
             try:
-                if action.keyword.lower() in f.read_text(encoding="utf-8", errors="ignore"):
+                if action.keyword.lower() in f.read_text(encoding="utf-8", errors="ignore").lower():
                     rel = str(f.relative_to(self.root))
                     matches.append(rel)
                     if len(matches) >= self.max_results:
