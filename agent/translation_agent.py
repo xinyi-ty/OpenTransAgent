@@ -424,6 +424,8 @@ class ReActTranslationAgent(Agent):
             text = (
                 f"{reason}\n"
                 f"请使用工具执行操作，不要只输出自然语言。"
+                f"如果你想读取文件，请立即调用 read_file；如果要修改文件，请调用 create_file 或 edit_file；"
+                f"如果所有必需目标文件已经存在并已验证，请调用 finish。"
                 f"可用工具包括：{tool_list}。"
             )
         on_event(

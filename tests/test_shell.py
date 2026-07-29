@@ -7,6 +7,8 @@ from tools.shell import (
     ExecuteCommandExecutor,
     _STDOUT_PREVIEW_LIMIT,
     _build_env,
+    _command_policy_violation,
+    _command_shape_advisory,
     _normalize_timeout,
     _preview_stream,
 )
@@ -36,6 +38,31 @@ def test_preview_stream_marks_truncation() -> None:
     assert "truncated 5 chars" in preview
 
 
+def test_command_shape_advisory_flags_combined_build_and_ctest() -> None:
+    code, message = _command_shape_advisory(
+        "cd build && cmake --build . --config Release && ctest --output-on-failure"
+    )
+
+    assert code == "noncanonical_ctest_command"
+    assert "ctest --test-dir build" in message
+
+
+def test_command_policy_blocks_build_plus_ctest() -> None:
+    code, message = _command_policy_violation(
+        "cmake --build build --config Release && ctest --test-dir build --output-on-failure -C Release"
+    )
+
+    assert code == "combined_build_and_test_blocked"
+    assert "Do not combine build and tests" in message
+
+
+def test_command_policy_blocks_protected_test_modification() -> None:
+    code, message = _command_policy_violation("del tests\\test_helpers.h")
+
+    assert code == "protected_infrastructure_command_blocked"
+    assert "Do not modify or delete" in message
+
+
 def test_execute_command_rejects_empty_command(tmp_path) -> None:
     obs = ExecuteCommandExecutor(str(tmp_path))(
         ExecuteCommandAction(command="   ")
@@ -52,6 +79,16 @@ def test_execute_command_rejects_missing_working_dir(tmp_path) -> None:
 
     assert obs.is_error is True
     assert "工作目录不存在" in obs.text
+
+
+def test_execute_command_blocks_policy_violations(tmp_path) -> None:
+    obs = ExecuteCommandExecutor(str(tmp_path))(
+        ExecuteCommandAction(command="cmake --build build --config Release && ctest --test-dir build")
+    )
+
+    assert obs.is_error is True
+    assert obs.advisory_code == "combined_build_and_test_blocked"
+    assert "Command blocked" in obs.text
 
 
 def test_execute_command_success(tmp_path) -> None:

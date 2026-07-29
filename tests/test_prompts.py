@@ -28,12 +28,12 @@ def test_tool_list_cache_refreshes_when_registry_changes() -> None:
     assert "## temporary_test_tool — Temporary test tool" in updated
 
 
-def test_unknown_language_pair_uses_generic_fallback() -> None:
+def test_known_unregistered_language_pair_uses_effective_route() -> None:
     prompt = build_react_prompt("java", "go", "demo")
 
     assert "Your task is to translate a java project to go." in prompt
     assert "For each source file, create the equivalent go file" in prompt
-    assert "ENVIRONMENT:" not in prompt
+    assert "ENVIRONMENT: Windows" in prompt
 
 
 def test_translation_order_takes_precedence_over_project_tree() -> None:
@@ -102,15 +102,68 @@ def test_dependency_layers_prompt_is_static_not_stale() -> None:
     assert "The runtime will announce which layer is currently unlocked" in prompt
 
 
-def test_prompt_mentions_edit_file_for_precise_fixes() -> None:
+def test_python_to_cpp_prompt_mentions_cpp_target_guidelines() -> None:
     prompt = build_react_prompt("python", "cpp", "demo")
 
     assert "## edit_file — Make a targeted exact replacement in an existing file; old_string must be non-empty" in prompt
     assert "old_string MUST be non-empty" in prompt
     assert "Use create_file for a new/empty file" in prompt
+    assert "Do not run build/tests until every expected target file" in prompt
+    assert "While fixing compile errors, run build only" in prompt
     assert "do not rerun the same full test command unless relevant files changed" in prompt
+    assert "execute_command already runs inside the translation workspace" in prompt
+    assert "Do not repeatedly run configure/build/ctest" in prompt
+    assert "read at most 3 representative test files" in prompt.lower()
+    assert "Do NOT use `cd /d` into guessed external directories" in prompt
+    assert "Do not call think for layers with 5 or fewer source files" in prompt
+    assert "call finish immediately" in prompt
+    assert "CPP TARGET GUIDELINES:" in prompt
+    assert "Do NOT create_file, edit_file, or rewrite CMakeLists.txt" in prompt
+    assert "public_tests/*, tests/*, or test/*" in prompt
+    assert "PYTHON TARGET GUIDELINES:" not in prompt
+    assert "Avoid fragile patterns like `sys.path.insert(0, '..')`" not in prompt
+
+
+def test_cpp_to_python_prompt_mentions_python_target_guidelines_only() -> None:
+    prompt = build_react_prompt("cpp", "python", "demo")
+
+    assert "PYTHON TARGET GUIDELINES:" in prompt
     assert "Avoid fragile patterns like `sys.path.insert(0, '..')`" in prompt
     assert "package-relative imports" in prompt
+    assert "standard-library module name conflicts" in prompt
+    assert "compatibility shim" in prompt
+    assert "CPP TARGET GUIDELINES:" not in prompt
+    assert "cmake --build build --config Release" not in prompt
+    assert "CMakeLists.txt" not in prompt
+
+
+def test_small_project_fast_path_is_added_for_five_or_fewer_files() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        source_files=["a.py", "b.py"],
+    )
+
+    assert "SMALL PROJECT FAST PATH:" in prompt
+    assert "This layer has 5 or fewer source files" in prompt
+    assert "Create each expected target file once" in prompt
+    assert "after all expected target files exist" in prompt
+
+
+def test_large_project_batching_is_added_for_larger_layers() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        source_files=["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"],
+    )
+
+    assert "SMALL PROJECT FAST PATH:" not in prompt
+    assert "LARGE LAYER BATCHING:" in prompt
+    assert "Read at most 4 source files" in prompt
+    assert "more than 5 read_file/create_file/edit_file calls" in prompt
+    assert "Read at most 3 representative test files" in prompt
 
 
 def test_reflection_guidelines_match_tool_schema() -> None:

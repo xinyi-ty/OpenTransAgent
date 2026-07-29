@@ -3,6 +3,7 @@
 import argparse
 import concurrent.futures
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -42,10 +43,15 @@ from workspace.manager import (prepare_source_workspace, get_project_tree,
                                compute_layers, LayerController,
                                copy_workspace_files, copy_source_files,
                                assign_tests_to_layers, copy_test_layer)
-from workspace.precheck import run_precheck
+from workspace.precheck import run_precheck, _cpp_test_target_name
 from analysis.test_analyzer import TestAnalysis, TestAnalyzer
-from config.languages import get_target_extensions
-from config.router import get_route, validate_pair
+from config.languages import (
+    get_target_extensions,
+    get_test_extensions,
+    get_test_unit_label,
+    should_refresh_precheck_after_test_copy,
+)
+from config.router import get_effective_route, validate_pair
 
 def parse_args():
     p = argparse.ArgumentParser(description="OpenTransAgent - 仓库级代码翻译")
@@ -116,6 +122,8 @@ def format_feedback(
 
     lines.append(f"Tests: {analysis.passed_tests}/{analysis.total_tests} "
                  f"passed ({analysis.overall_pass_rate:.1f}%)")
+    if not analysis.compilation.success and analysis.compilation.errors:
+        lines.append(f"\nCompilation output:\n{analysis.compilation.errors}")
 
     if analysis.modules:
         for name, mod in analysis.modules.items():
@@ -145,6 +153,69 @@ def _quote_cmd_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
+def _test_result_unit_label(source_language: str, target_language: str) -> str:
+    """返回测试统计单位，避免 CTest target 被误读为单个 test case。"""
+    _ = source_language
+    return get_test_unit_label(target_language)
+
+
+def _format_required_targets_for_layer(
+    layer_files: list[str] | None,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """生成层切换消息中的必需目标文件清单。"""
+    if not layer_files:
+        return ""
+    targets = [
+        _expected_target_for_source(src, source_language, target_language)
+        for src in layer_files
+    ]
+    lines = [
+        "",
+        "Required target files for this layer:",
+        *(f"- {target}" for target in targets),
+        "",
+        "Create all required target files before running build/tests.",
+    ]
+    return "\n".join(lines)
+
+
+def _adaptive_steps_per_round(
+    base_steps: int,
+    layer_files: list[str] | None,
+    layer_tests: list[str] | None,
+) -> int:
+    """按当前层复杂度调整单轮 step 上限，避免大层在一个 round 内无限膨胀上下文。"""
+    file_count = len(layer_files or [])
+    test_count = len(layer_tests or [])
+    if file_count >= 10:
+        return min(base_steps, 30)
+    if file_count >= 6:
+        return min(base_steps, 40)
+    if file_count >= 4 or test_count >= 4:
+        return max(base_steps, 50)
+    if file_count >= 2 and test_count >= 3:
+        return max(base_steps, 40)
+    return base_steps
+
+
+def _format_large_layer_guidance(layer_files: list[str] | None) -> str:
+    """生成大层批处理提示，减少一次性读写/测试导致的长耗时。"""
+    if len(layer_files or []) <= 5:
+        return ""
+    return (
+        "\n\nLarge layer batching rules:"
+        "\n- Do not read every source file before writing; process at most 4 source files per batch."
+        "\n- Do not call more than 5 read_file/create_file/edit_file tools in one response."
+        "\n- Read at most 3 representative test files before generating target files; read more only after a concrete failure points to them."
+        "\n- Create missing target files before running broad tests."
+        "\n- Use one focused check while developing; run full regression only after all required target files exist."
+        "\n- execute_command already runs in the workspace; do not cd into guessed external project paths."
+        "\n- If a lower-layer file needs changes, use edit_file only; never full-rewrite it."
+    )
+
+
 def _collect_visible_test_files(
     test_layers: list[list[str]] | None,
     layer_idx: int,
@@ -159,29 +230,29 @@ def _collect_visible_test_files(
 
 
 def _build_layer_test_command(test_files: list[str], working_dir: str) -> str | None:
-    """按累计可见测试文件构造测试命令，尽量避免未引用路径和无效 exe 路径。"""
-    root = Path(working_dir)
-    all_subcmds: list[str] = []
+    """按累计可见测试文件构造测试命令。"""
+    _ = working_dir
+    py_subcmds: list[str] = []
+    cpp_targets: list[str] = []
+    python_test_exts = set(get_test_extensions("python"))
+    cpp_test_exts = set(get_test_extensions("cpp"))
+
     for tf in test_files:
-        if tf.endswith(".py"):
-            all_subcmds.append(f"python -m pytest {_quote_cmd_arg(tf)} -v 2>&1")
-            continue
+        suffix = Path(tf).suffix.lower()
+        if suffix in python_test_exts:
+            py_subcmds.append(f"python -m pytest {_quote_cmd_arg(tf)} -v")
+        elif suffix in cpp_test_exts:
+            cpp_targets.append(_cpp_test_target_name(tf))
 
-        stem = Path(tf).stem
-        paths = [
-            Path("build") / f"{stem}.exe",
-            Path("build") / "Debug" / f"{stem}.exe",
-            Path("build") / "Release" / f"{stem}.exe",
-        ]
-        existing = [str(p) for p in paths if (root / p).exists()]
-        if existing:
-            all_subcmds.extend(f"{_quote_cmd_arg(p)} 2>&1" for p in existing)
-        else:
-            all_subcmds.append(" || ".join(
-                f'if exist "{p}" "{p}"' for p in paths
-            ))
+    all_subcmds = py_subcmds
+    if cpp_targets:
+        pattern = "^(" + "|".join(re.escape(t) for t in dict.fromkeys(cpp_targets)) + ")$"
+        all_subcmds.append(
+            "ctest --test-dir build --output-on-failure -C Release "
+            f'-R "{pattern}"'
+        )
 
-    return " & ".join(all_subcmds) if all_subcmds else None
+    return " && ".join(all_subcmds) if all_subcmds else None
 
 
 @dataclass(frozen=True)
@@ -208,7 +279,7 @@ def _expected_target_for_source(
     target_language: str,
 ) -> str:
     """用语言路由生成期望目标路径；无路由时退回源路径。"""
-    route = get_route(source_language, target_language)
+    route = get_effective_route(source_language, target_language)
     if route and route.file_extension_map:
         return route.file_extension_map(source_file)
     return source_file
@@ -487,6 +558,14 @@ def main():
             # 复制 Layer 0 的测试文件（仅 Python → C++）
             if test_layers:
                 copy_test_layer(test_layers[0], target_project, source_ws)
+                # 测试文件到位后，重新生成 CMakeLists.txt 使其包含 test executable 目标。
+                # Python 源项目可能自带 Makefile；它不应阻止 C++/CTest 脚手架更新。
+                if test_layers[0] and should_refresh_precheck_after_test_copy(args.target_language):
+                    cmake_path = Path(source_ws) / "CMakeLists.txt"
+                    if cmake_path.exists():
+                        cmake_path.unlink()
+                    for line in run_precheck(source_ws, args.target_language, project_name):
+                        logger.info(f"  {line}")
             logger.info(f"📋 Initialized workspace with {len(layers[0])} source "
                         f"file(s) + infrastructure")
         else:
@@ -575,12 +654,31 @@ def main():
         completeness_attempts = 0
         last_missing_targets: tuple[str, ...] = ()
         prev_file_count = 0  # 记录上一轮的文件数，判断 LLM 是否在产出
+        layer_files = layers[layer_idx] if layers and layer_idx < len(layers) else []
+        layer_tests_for_budget = test_layers[layer_idx] if test_layers and layer_idx < len(test_layers) else []
+        effective_steps_per_round = _adaptive_steps_per_round(
+            steps_per_round,
+            layer_files,
+            layer_tests_for_budget,
+        )
+        try:
+            conv.max_iteration_per_run = effective_steps_per_round
+        except Exception:
+            pass
+        if effective_steps_per_round != steps_per_round:
+            logger.info(
+                f"📋 Adaptive step budget for Layer {layer_idx}: "
+                f"{effective_steps_per_round} steps/round "
+                f"({len(layer_files)} source file(s), {len(layer_tests_for_budget)} new test file(s))"
+            )
         if trace_logger:
             trace_logger.set_context(layer_idx=layer_idx)
             trace_logger.write("layer_start", payload={
                 "layer": layer_idx,
                 "total_layers": layer_count,
-                "file_count": len(layers[layer_idx]) if layers else 0,
+                "file_count": len(layer_files),
+                "test_file_count": len(layer_tests_for_budget),
+                "steps_per_round": effective_steps_per_round,
             })
         if layer_idx > 0:
             # 解锁下一层：源文件 + 测试文件
@@ -590,11 +688,19 @@ def main():
             if test_layers and layer_idx < len(test_layers):
                 copy_test_layer(test_layers[layer_idx], target_project, source_ws)
                 logger.info(f"📋 Copied {len(test_layers[layer_idx])} test file(s) (Layer {layer_idx})")
+                if test_layers[layer_idx] and should_refresh_precheck_after_test_copy(args.target_language):
+                    cmake_path = Path(source_ws) / "CMakeLists.txt"
+                    if cmake_path.exists():
+                        cmake_path.unlink()
+                    for line in run_precheck(source_ws, args.target_language, project_name):
+                        logger.info(f"  {line}")
             conv.state.execution_status = ConversationExecutionStatus.RUNNING
             msg = (f"Layer {layer_idx - 1} passed. "
                    f"Now translating Layer {layer_idx}: "
                    f"{', '.join(layers[layer_idx])}. "
-                   f"These files depend on already-translated code.")
+                   f"These files depend on already-translated code."
+                   f"{_format_required_targets_for_layer(layers[layer_idx], args.source_language, args.target_language)}"
+                   f"{_format_large_layer_guidance(layers[layer_idx])}")
             conv.send_message(msg)
 
         for round_idx in range(1, max_iter + 1):
@@ -670,13 +776,46 @@ def main():
                 exit_reason = "stuck"
                 break
             if status == ConversationExecutionStatus.ERROR:
-                # SDK 层内部错误（例如 agent 达到 max_iterations）通常是
-                # 可恢复的——只是本轮 steps 不够用，应进入下一轮继续而非直接终止。
-                logger.info(f"  ⚠️ Agent error (will retry in next round)")
-                conv.state.execution_status = ConversationExecutionStatus.RUNNING
-                conv.send_message(
-                    "Continue translating. Do NOT call finish until all files are done."
+                # SDK 层内部 ERROR 常见原因是本轮 max_iteration_per_run 用尽。
+                # 这不是致命错误；下一轮继续推进，并用更准确的日志避免误导。
+                logger.info(
+                    f"  ⏭️ Round step budget exhausted "
+                    f"({effective_steps_per_round} step(s)); continuing in next round"
                 )
+                budget_completeness = _check_translation_completeness(
+                    source_ws,
+                    layers,
+                    translation_order,
+                    layer_idx,
+                    args.source_language,
+                    args.target_language,
+                )
+                conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                if budget_completeness.missing:
+                    missing_lines = "\n".join(
+                        f"- {item.source} -> {item.expected}"
+                        for item in budget_completeness.missing[:10]
+                    )
+                    conv.send_message(
+                        "Round step budget was exhausted before this layer was complete. "
+                        "Continue in small batches and create the missing required target files before running build/tests:\n"
+                        f"{missing_lines}"
+                        f"{_format_large_layer_guidance(layer_files)}"
+                    )
+                    if trace_logger:
+                        trace_logger.write("step_budget_completeness_check", payload={
+                            "layer": layer_idx,
+                            "missing_count": len(budget_completeness.missing),
+                            "missing": [item.__dict__ for item in budget_completeness.missing[:20]],
+                        })
+                else:
+                    conv.send_message(
+                        "Round step budget was exhausted, but all required target files appear to exist. "
+                        "Do NOT continue broad self-testing or exploratory edits. Your next response should either "
+                        "call finish so the runtime can run completeness and cumulative regression, or make one "
+                        "minimal source edit only if the immediately previous build/test output identified a concrete error."
+                        f"{_format_large_layer_guidance(layer_files)}"
+                    )
                 continue
             if status == ConversationExecutionStatus.PAUSED:
                 # SDK 内部暂停（例如被 interrupt 后未完全恢复），
@@ -714,6 +853,7 @@ def main():
                            "translation with create_file. Do not spend steps exploring.")
                 else:
                     msg = "Continue working on the current layer. Call finish when all files are translated."
+                    msg += _format_large_layer_guidance(layer_files)
                 if trace_logger and idle_reason:
                     trace_logger.write("idle_nudge", payload={
                         "reason": idle_reason,
@@ -832,7 +972,8 @@ def main():
                     logger.info(f"  🔧 Compilation: "
                                 f"{'SUCCESS' if analysis.compilation.success else 'FAILED'}")
                     layer_label = f"Layer {layer_idx} regression" if layer_count > 1 else "All"
-                    logger.info(f"  📊 {layer_label} tests: "
+                    unit_label = _test_result_unit_label(args.source_language, args.target_language)
+                    logger.info(f"  📊 {layer_label} {unit_label}: "
                                 f"{analysis.passed_tests}/{analysis.total_tests} "
                                 f"({analysis.overall_pass_rate:.1f}%)")
                     if analysis.modules:
@@ -885,8 +1026,9 @@ def main():
             if exit_reason:
                 break
 
-            # ④ 测试没全过 → 重置状态让 agent 继续修
-            if final_analysis and final_analysis.total_tests == 0:
+            # ④ 测试没全过 → 重置状态让 agent 继续修。
+            # 注意：编译失败会导致 total_tests=0，但这不是“无测试”，必须反馈给 LLM 修复。
+            if final_analysis and final_analysis.total_tests == 0 and final_analysis.compilation.success:
                 if layer_idx == layer_count - 1:
                     no_tests = True
                     exit_reason = "no_tests"
@@ -903,6 +1045,8 @@ def main():
                     trace_logger.write("feedback_sent", payload={
                         "length": len(feedback),
                         "reflection_enabled": reflection_enabled,
+                        "compilation_success": final_analysis.compilation.success if final_analysis else None,
+                        "total_tests": final_analysis.total_tests if final_analysis else None,
                     })
 
         if exit_reason:
@@ -973,7 +1117,8 @@ def main():
     if final_analysis:
         logger.info(f"  🔧 Compilation: "
                     f"{'SUCCESS' if final_analysis.compilation.success else 'FAILED'}")
-        logger.info(f"  📊 Tests: {final_analysis.passed_tests}/{final_analysis.total_tests} "
+        unit_label = _test_result_unit_label(args.source_language, args.target_language)
+        logger.info(f"  📊 {unit_label}: {final_analysis.passed_tests}/{final_analysis.total_tests} "
                     f"({final_analysis.overall_pass_rate:.1f}%)")
         if final_analysis.modules:
             for name, mod in final_analysis.modules.items():

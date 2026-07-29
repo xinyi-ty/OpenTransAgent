@@ -7,10 +7,20 @@ from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
 from pydantic import Field
 
+from config.languages import PROTECTED_INFRA_FILES, PROTECTED_TEST_DIRS
+
 # ── 依赖层控制（仅用于 create_file，read_file 靠物理隔离）──
 _LAYER_CTRL = None
 _READ_TEXT_LIMIT = 5000
 _LIST_MAX_ENTRIES = 200
+_PROTECTED_INFRA_FILES = PROTECTED_INFRA_FILES
+_PROTECTED_TEST_DIRS = PROTECTED_TEST_DIRS
+
+
+def _is_protected_generated_or_test_file(rel: str) -> bool:
+    """Agent 不应修改运行时生成的构建基础设施或测试 oracle。"""
+    normalized = rel.replace("\\", "/")
+    return normalized in _PROTECTED_INFRA_FILES or normalized.startswith(_PROTECTED_TEST_DIRS)
 
 
 def set_layer_ctrl(ctrl):
@@ -150,6 +160,16 @@ class CreateFileExecutor(ToolExecutor):
             )
         rel = _to_rel(self.root, p)
 
+        if _is_protected_generated_or_test_file(rel):
+            return CreateFileObservation.from_text(
+                text=(
+                    f"'{rel}' is protected build/test infrastructure. "
+                    "Do not create_file or rewrite generated infrastructure or test oracle files; "
+                    "fix translated source files instead."
+                ),
+                is_error=True, path=rel, size=0,
+            )
+
         # 层检查：不能提前创建高层的文件
         ctrl = _get_layer_ctrl()
         if ctrl and ctrl.active:
@@ -161,20 +181,46 @@ class CreateFileExecutor(ToolExecutor):
 
         try:
             existed_before = p.is_file()
-            _atomic_write_text(p, action.content)
             previous_writes = self._successful_writes.get(rel, 0)
             write_count = previous_writes + 1
-            self._successful_writes[rel] = write_count
             rewrite_count = max(0, write_count - 1) if previous_writes else (1 if existed_before else 0)
+            if rewrite_count >= 2:
+                return CreateFileObservation.from_text(
+                    text=(
+                        f"Refusing repeated full rewrite of {rel}. This file has already been "
+                        f"fully rewritten {rewrite_count} time(s); use edit_file with a precise "
+                        "old_string for further fixes."
+                    ),
+                    is_error=True, path=rel, size=0,
+                    advisory_code="repeated_full_rewrite_blocked",
+                    advisory_message="Use edit_file for further fixes after repeated full rewrites.",
+                    write_count=write_count,
+                    rewrite_count=rewrite_count,
+                )
+            ctrl = _get_layer_ctrl()
+            target_layer = ctrl.target_layer(rel) if ctrl and ctrl.active and hasattr(ctrl, "target_layer") else None
+            if existed_before and target_layer is not None and target_layer < ctrl.current:
+                return CreateFileObservation.from_text(
+                    text=(
+                        f"Refusing full rewrite of previously passed layer file {rel}. "
+                        "Use edit_file for a minimal compatibility fix instead."
+                    ),
+                    is_error=True, path=rel, size=0,
+                    advisory_code="previous_layer_full_rewrite_blocked",
+                    advisory_message="Use edit_file for minimal changes to previously passed layer files.",
+                    write_count=write_count,
+                    rewrite_count=rewrite_count,
+                )
+            _atomic_write_text(p, action.content)
+            self._successful_writes[rel] = write_count
             advisory_code = ""
             advisory_message = ""
             text = f"[OK] Created file: {rel} ({len(action.content)} chars)"
-            if rewrite_count >= 2:
-                advisory_code = "repeated_full_rewrite"
+            if rewrite_count == 1:
+                advisory_code = "full_rewrite_existing_file"
                 advisory_message = (
-                    f"This file has been fully rewritten {rewrite_count} times. "
-                    f"For another small correction, prefer edit_file with a precise non-empty "
-                    f"old_string; keep using create_file when a complete replacement is intentional."
+                    f"This replaced existing file {rel}. For additional corrections, use edit_file "
+                    "with a precise non-empty old_string instead of another full rewrite."
                 )
                 text += f"\nAdvisory: {advisory_message}"
             return CreateFileObservation.from_text(
@@ -227,6 +273,16 @@ class EditFileExecutor(ToolExecutor):
                 text=str(e), is_error=True, path=action.filepath, replacements=0,
             )
         rel = _to_rel(self.root, p)
+
+        if _is_protected_generated_or_test_file(rel):
+            return EditFileObservation.from_text(
+                text=(
+                    f"'{rel}' is protected build/test infrastructure. "
+                    "Do not edit generated infrastructure or test oracle files; "
+                    "fix translated source files instead."
+                ),
+                is_error=True, path=rel, replacements=0,
+            )
 
         ctrl = _get_layer_ctrl()
         if ctrl and ctrl.active and not ctrl.is_unlocked(rel):

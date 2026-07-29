@@ -90,20 +90,82 @@ def test_create_file_returns_relative_path_and_overwrites_atomically(tmp_path: P
     assert (tmp_path / "src" / "out.py").read_text(encoding="utf-8") == "two"
 
 
-def test_create_file_advises_after_repeated_full_rewrites(tmp_path: Path) -> None:
+def test_create_file_rejects_full_rewrite_of_existing_cmakelists(tmp_path: Path) -> None:
+    cmake = tmp_path / "CMakeLists.txt"
+    cmake.write_text("generated\n", encoding="utf-8")
+
+    obs = CreateFileExecutor(str(tmp_path))(
+        CreateFileAction(filepath="CMakeLists.txt", content="replacement\n")
+    )
+
+    assert obs.is_error is True
+    assert "protected build/test infrastructure" in obs.text
+    assert cmake.read_text(encoding="utf-8") == "generated\n"
+
+
+def test_create_file_rejects_rewrite_of_existing_test_file(tmp_path: Path) -> None:
+    test_file = tmp_path / "tests" / "test_demo.cpp"
+    test_file.parent.mkdir()
+    test_file.write_text("oracle\n", encoding="utf-8")
+
+    obs = CreateFileExecutor(str(tmp_path))(
+        CreateFileAction(filepath="tests/test_demo.cpp", content="changed\n")
+    )
+
+    assert obs.is_error is True
+    assert "protected build/test infrastructure" in obs.text
+    assert test_file.read_text(encoding="utf-8") == "oracle\n"
+
+
+def test_create_file_rejects_new_test_oracle_file(tmp_path: Path) -> None:
+    obs = CreateFileExecutor(str(tmp_path))(
+        CreateFileAction(filepath="tests/test_new.cpp", content="oracle\n")
+    )
+
+    assert obs.is_error is True
+    assert "protected build/test infrastructure" in obs.text
+    assert not (tmp_path / "tests" / "test_new.cpp").exists()
+
+
+def test_protected_file_detection_normalizes_backslashes(tmp_path: Path) -> None:
+    test_file = tmp_path / "public_tests" / "test_demo.cpp"
+    test_file.parent.mkdir()
+    test_file.write_text("oracle\n", encoding="utf-8")
+
+    obs = CreateFileExecutor(str(tmp_path))(
+        CreateFileAction(filepath="public_tests\\test_demo.cpp", content="changed\n")
+    )
+
+    assert obs.is_error is True
+    assert "protected build/test infrastructure" in obs.text
+    assert test_file.read_text(encoding="utf-8") == "oracle\n"
+
+
+def test_create_file_allows_non_cpp_python_target_extensions(tmp_path: Path) -> None:
+    executor = CreateFileExecutor(str(tmp_path))
+
+    for rel in ["src/Foo.java", "src/main.go", "src/lib.rs", "src/index.ts"]:
+        obs = executor(CreateFileAction(filepath=rel, content="x\n"))
+        assert obs.is_error is False
+        assert obs.path == rel
+        assert (tmp_path / rel).read_text(encoding="utf-8") == "x\n"
+
+
+def test_create_file_blocks_after_repeated_full_rewrites(tmp_path: Path) -> None:
     executor = CreateFileExecutor(str(tmp_path))
     first = executor(CreateFileAction(filepath="out.py", content="one"))
     second = executor(CreateFileAction(filepath="out.py", content="two"))
     third = executor(CreateFileAction(filepath="out.py", content="three"))
 
     assert first.advisory_code == ""
-    assert second.advisory_code == ""
-    assert third.is_error is False
-    assert third.advisory_code == "repeated_full_rewrite"
+    assert second.is_error is False
+    assert second.advisory_code == "full_rewrite_existing_file"
+    assert third.is_error is True
+    assert third.advisory_code == "repeated_full_rewrite_blocked"
     assert third.write_count == 3
     assert third.rewrite_count == 2
-    assert "prefer edit_file" in third.advisory_message
-    assert (tmp_path / "out.py").read_text(encoding="utf-8") == "three"
+    assert "Use edit_file" in third.advisory_message
+    assert (tmp_path / "out.py").read_text(encoding="utf-8") == "two"
 
 
 def test_create_file_advisory_state_is_per_executor_and_path(tmp_path: Path) -> None:
@@ -116,7 +178,33 @@ def test_create_file_advisory_state_is_per_executor_and_path(tmp_path: Path) -> 
     other_executor = second(CreateFileAction(filepath="a.py", content="four"))
 
     assert other_path.advisory_code == ""
-    assert other_executor.advisory_code == ""
+    assert other_executor.advisory_code == "full_rewrite_existing_file"
+
+
+def test_create_file_blocks_full_rewrite_of_previous_layer_file(tmp_path: Path) -> None:
+    class Ctrl:
+        active = True
+        current = 1
+
+        def target_layer(self, filepath: str) -> int | None:
+            return 0 if filepath == "base.cpp" else None
+
+        def is_unlocked(self, filepath: str) -> bool:
+            return True
+
+    path = tmp_path / "base.cpp"
+    path.write_text("old\n", encoding="utf-8")
+    set_layer_ctrl(Ctrl())
+    try:
+        obs = CreateFileExecutor(str(tmp_path))(
+            CreateFileAction(filepath="base.cpp", content="new\n")
+        )
+    finally:
+        set_layer_ctrl(None)
+
+    assert obs.is_error is True
+    assert obs.advisory_code == "previous_layer_full_rewrite_blocked"
+    assert path.read_text(encoding="utf-8") == "old\n"
 
 
 def test_create_file_layer_lock_uses_relative_path(tmp_path: Path) -> None:
@@ -158,6 +246,27 @@ def test_edit_file_replaces_unique_string(tmp_path: Path) -> None:
     assert obs.is_error is False
     assert obs.replacements == 1
     assert path.read_text(encoding="utf-8") == "one\nthree\n"
+
+
+def test_edit_file_rejects_cmakelists_and_test_oracle(tmp_path: Path) -> None:
+    cmake = tmp_path / "CMakeLists.txt"
+    cmake.write_text("generated\n", encoding="utf-8")
+    test_file = tmp_path / "public_tests" / "test_demo.cpp"
+    test_file.parent.mkdir()
+    test_file.write_text("oracle\n", encoding="utf-8")
+
+    cmake_obs = EditFileExecutor(str(tmp_path))(
+        EditFileAction(filepath="CMakeLists.txt", old_string="generated", new_string="changed")
+    )
+    test_obs = EditFileExecutor(str(tmp_path))(
+        EditFileAction(filepath="public_tests/test_demo.cpp", old_string="oracle", new_string="changed")
+    )
+
+    assert cmake_obs.is_error is True
+    assert test_obs.is_error is True
+    assert "protected build/test infrastructure" in cmake_obs.text
+    assert cmake.read_text(encoding="utf-8") == "generated\n"
+    assert test_file.read_text(encoding="utf-8") == "oracle\n"
 
 
 def test_edit_file_rejects_workspace_escape(tmp_path: Path) -> None:

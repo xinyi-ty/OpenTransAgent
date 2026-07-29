@@ -6,14 +6,10 @@ from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
 from pydantic import Field
 
-_CODE_EXTENSIONS = (
-    ".py", ".java", ".cpp", ".cxx", ".cc", ".c", ".h", ".hpp", ".hxx",
-    ".cs", ".rs", ".go", ".js", ".jsx", ".ts", ".tsx",
-)
-_SKIP_DIRS = {
-    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
-    "__pycache__", ".pytest_cache", "build", "dist", "target", "CMakeFiles",
-}
+from config.languages import COMMON_SKIP_DIRS, get_all_code_extensions
+
+_CODE_EXTENSIONS = get_all_code_extensions()
+_SKIP_DIRS = COMMON_SKIP_DIRS
 _MAX_FILE_BYTES = 1_000_000
 _MAX_SCAN_FILES = 3000
 _CONTEXT_LIMIT = 160

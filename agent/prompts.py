@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 
-from config.router import get_route
+from config.languages import normalize_language
+from config.router import get_effective_route
 from tools.registry import TOOL_DEFINITIONS, BUILTIN_TOOL_DEFINITIONS
 
 # ═══════════════════════════════════════════════════════════════
@@ -39,12 +40,31 @@ TRANSLATION GUIDELINES:
 3. {pair_instruction}
 4. Prefer writing each target file once with a complete implementation. Avoid repeatedly overwriting the same file with tiny changes.
 5. Use edit_file for small, precise fixes to existing files; use create_file for new files or full rewrites.
-6. After creating files, update any build configuration files (e.g. CMakeLists.txt) to reference them.
-7. When translating to Python, generate correct import paths from the start:
-   - Prefer package-relative imports (e.g. `from .. import enum`) for files in subdirectories.
-   - Avoid fragile patterns like `sys.path.insert(0, '..')`; if sys.path is unavoidable,
-     use `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` instead.
-8. Run focused checks when useful, but do not rerun the same full test command unless relevant files changed. Call finish after a coherent batch; the runtime will run cumulative regression tests and send feedback if anything fails.{reflection_guidelines}"""
+6. Run focused checks when useful, but do not rerun the same full test command unless relevant files changed. Once all expected files exist and tests pass, call finish immediately — do NOT spend extra steps verifying, listing, or re-running.
+7. execute_command already runs inside the translation workspace. Do NOT cd into guessed external project paths; use workspace-relative commands.
+8. Do not call think for layers with 5 or fewer source files unless a failure is ambiguous. If you know which file to inspect, call read_file directly; never respond with only a natural-language plan.{target_guidelines}{reflection_guidelines}"""
+
+PYTHON_TARGET_GUIDELINES = """
+
+PYTHON TARGET GUIDELINES:
+1. Generate correct import paths from the start.
+2. Prefer package-relative imports (e.g. `from .. import enum`) for files in subdirectories.
+3. Avoid fragile patterns like `sys.path.insert(0, '..')`; if sys.path is unavoidable,
+   use `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` instead.
+4. Avoid Python standard-library module name conflicts (for example enum.py, typing.py,
+   json.py, dataclasses.py, collections.py). If an expected target file has such a name,
+   keep that expected file present for completeness, but put the real implementation in a
+   non-conflicting module name and make the expected file a small compatibility shim."""
+
+CPP_TARGET_GUIDELINES = """
+
+CPP TARGET GUIDELINES:
+1. Do not run build/tests until every expected target file for the current layer exists.
+2. While fixing compile errors, run build only (`cmake --build build --config Release`); run ctest only after build succeeds.
+3. Do not repeatedly run configure/build/ctest inside the agent loop. After all required target files exist, prefer calling finish so the runtime can run cumulative regression. Only rerun build after changing C++ source/header files.
+4. Read only the tests needed for the current failure. For large layers, read at most 3 representative test files before generating target files; read more tests only after a concrete failing test points to them.
+5. execute_command runs in the workspace already. Do NOT use `cd /d` into guessed external directories such as E:/Agent_Projects or the dataset source path.
+6. Treat generated build/test infrastructure as read-only. Do NOT create_file, edit_file, or rewrite CMakeLists.txt, run_tests.sh, public_tests/*, tests/*, or test/*; translate source files instead."""
 
 REFLECTION_GUIDELINES = """
 
@@ -138,6 +158,45 @@ def _build_files_to_create_section(source_files: list[str], route) -> str:
     return "FILES TO CREATE:\n" + "\n".join(f"  - {f}" for f in target_files)
 
 
+def _build_target_guidelines(target_language: str) -> str:
+    """按目标语言追加专属提示，避免 Python/C++ 规则互相污染。"""
+    normalized = normalize_language(target_language)
+    if normalized == "python":
+        return PYTHON_TARGET_GUIDELINES
+    if normalized == "cpp":
+        return CPP_TARGET_GUIDELINES
+    return ""
+
+
+def _build_small_project_fast_path_section(source_files: list[str]) -> str:
+    """小项目快速路径提示，减少低价值探索和重复验证。"""
+    _ = source_files
+    return (
+        "SMALL PROJECT FAST PATH:\n"
+        "This layer has 5 or fewer source files. Keep the loop tight:\n"
+        "  - Read each visible test and each source file at most once unless an error requires rereading.\n"
+        "  - Create each expected target file once; prefer edit_file for follow-up fixes.\n"
+        "  - Do not inspect or rewrite build/test infrastructure.\n"
+        "  - Run at most one configure/build/test cycle after all expected target files exist; rerun only after code changes.\n"
+        "  - After tests pass, call finish immediately."
+    )
+
+
+def _build_large_project_batch_section(source_files: list[str]) -> str:
+    """大层批处理提示，避免一次性读写过多文件导致上下文和耗时膨胀。"""
+    _ = source_files
+    return (
+        "LARGE LAYER BATCHING:\n"
+        "This layer has more than 5 source files. Keep each ReAct step small and productive:\n"
+        "  - Do NOT bulk-read every source file before writing. Read at most 4 source files, then create or edit their target files.\n"
+        "  - Do NOT issue more than 5 read_file/create_file/edit_file calls in one response.\n"
+        "  - Translate in batches, but still create every file listed in FILES TO CREATE before calling finish.\n"
+        "  - Read at most 3 representative test files before generating target files; read more only after a concrete failure points to them.\n"
+        "  - Run focused checks on one representative file while developing; run full regression only after all expected files exist.\n"
+        "  - Avoid repeated full-project/example test loops unless code changed since the last run."
+    )
+
+
 def _build_dependency_layers_section(
     layers: list[list[str]],
     current_layer: int,
@@ -196,7 +255,7 @@ def build_react_prompt(
       5. 待生成的目标文件列表（可选）
       6. 依赖层 / 翻译顺序指引（可选）
     """
-    route = get_route(source_language, target_language)
+    route = get_effective_route(source_language, target_language)
     sections: list[str] = []
 
     # ── 1. 角色与任务 ──────────────────────────────────────────
@@ -223,6 +282,7 @@ def build_react_prompt(
     sections.append(
         GUIDELINES.format(
             pair_instruction=pair_instruction,
+            target_guidelines=_build_target_guidelines(target_language),
             reflection_guidelines=reflection_guidelines,
         )
     )
@@ -240,6 +300,10 @@ def build_react_prompt(
     )
     if selected_source_files:
         sections.append(_build_files_to_create_section(selected_source_files, route))
+        if len(selected_source_files) <= 5:
+            sections.append(_build_small_project_fast_path_section(selected_source_files))
+        else:
+            sections.append(_build_large_project_batch_section(selected_source_files))
 
     # ── 6. 依赖层 / 翻译顺序 ───────────────────────────────────
     if layers:

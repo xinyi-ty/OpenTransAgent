@@ -8,12 +8,13 @@ from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
 from pydantic import Field
 
+from config.languages import COMMON_SKIP_DIRS
+
 _STDOUT_PREVIEW_LIMIT = 3000
 _STDERR_PREVIEW_LIMIT = 1000
 _FINGERPRINT_MAX_FILES = 5000
-_FINGERPRINT_SKIP_DIRS = {
-    ".git", ".hg", ".svn", ".pytest_cache", "__pycache__", ".mypy_cache",
-    ".ruff_cache", "htmlcov", "logs", "build", "dist", "CMakeFiles", ".persist",
+_FINGERPRINT_SKIP_DIRS = COMMON_SKIP_DIRS | {
+    ".mypy_cache", ".ruff_cache", "htmlcov", "logs", ".persist",
 }
 
 
@@ -74,6 +75,41 @@ def _format_result(command: str, stdout: str, stderr: str, exit_code: int) -> st
     return output
 
 
+def _command_shape_advisory(command: str) -> tuple[str, str]:
+    """给常见低效 CMake/CTest 命令形态提示，不阻塞执行。"""
+    normalized = " ".join(command.lower().split())
+    if "ctest" in normalized and "cd build" in normalized:
+        return (
+            "noncanonical_ctest_command",
+            "Use `ctest --test-dir build --output-on-failure -C Release` instead of `cd build && ctest ...`.",
+        )
+    return "", ""
+
+
+def _command_policy_violation(command: str) -> tuple[str, str]:
+    """阻断会破坏测试/脚手架或导致 C++ 自测循环的命令。"""
+    normalized = " ".join(command.lower().replace("\\", "/").split())
+    if "ctest" in normalized and "cmake --build" in normalized:
+        return (
+            "combined_build_and_test_blocked",
+            "Do not combine build and tests. Run `cmake --build build --config Release` first; only run ctest after build succeeds.",
+        )
+
+    destructive = (
+        "del ", "erase ", "rm ", "remove-item ", "ren ", "rename ", "move ",
+        "copy ", "xcopy ", "robocopy ", "echo ", "type ", ">",
+    )
+    protected_markers = (
+        "tests/", "test/", "public_tests/", "cmakelists.txt", "run_tests.sh", "run_public_tests.sh",
+    )
+    if any(op in normalized for op in destructive) and any(marker in normalized for marker in protected_markers):
+        return (
+            "protected_infrastructure_command_blocked",
+            "Do not modify or delete generated infrastructure or test oracle files via shell commands; fix translated source files instead.",
+        )
+    return "", ""
+
+
 def _workspace_fingerprint(root: Path) -> tuple[tuple[str, int, int], ...] | None:
     """轻量记录相关 workspace 文件状态；失败时关闭 advisory，不影响命令执行。"""
     try:
@@ -113,6 +149,18 @@ class ExecuteCommandExecutor(ToolExecutor):
                 stderr="工作目录不存在", exit_code=-1, command=command,
             )
 
+        policy_code, policy_message = _command_policy_violation(command)
+        if policy_message:
+            return ExecuteCommandObservation.from_text(
+                text=f"Command blocked: {policy_message}",
+                is_error=True,
+                stderr=policy_message,
+                exit_code=-1,
+                command=command,
+                advisory_code=policy_code,
+                advisory_message=policy_message,
+            )
+
         timeout = _normalize_timeout(action.timeout, self.default_timeout)
         before_fingerprint = _workspace_fingerprint(self.working_dir)
         try:
@@ -127,8 +175,7 @@ class ExecuteCommandExecutor(ToolExecutor):
                 env=_build_env(),
             )
             output = _format_result(command, result.stdout, result.stderr, result.returncode)
-            advisory_code = ""
-            advisory_message = ""
+            advisory_code, advisory_message = _command_shape_advisory(command)
             repeat_count = 0
             if result.returncode == 0:
                 previous = self._successful_commands.get(command)
@@ -141,13 +188,14 @@ class ExecuteCommandExecutor(ToolExecutor):
                             f"workspace changes. Reuse the previous result or make a targeted change "
                             f"before rerunning it, unless this repetition is intentional."
                         )
-                        output += f"\nAdvisory: {advisory_message}"
                 else:
                     repeat_count = 1
                 after_fingerprint = _workspace_fingerprint(self.working_dir)
                 self._successful_commands[command] = (after_fingerprint, repeat_count)
             else:
                 self._successful_commands.pop(command, None)
+            if advisory_message:
+                output += f"\nAdvisory: {advisory_message}"
             return ExecuteCommandObservation.from_text(
                 text=output, stdout=result.stdout, stderr=result.stderr,
                 exit_code=result.returncode, command=command,

@@ -303,14 +303,12 @@ class TestAnalyzer:
             if "pytest" in all_text and "cmake" not in all_text:
                 return "echo OK", "python -m pytest -v"
 
-            # cmake 项目 — 独立编译每个测试，逐个运行
+            # cmake 项目 — 统一使用 CTest 汇总，避免逐个 exe 搜索漏掉路径化 target 名。
             if "cmake" in all_text:
                 return (
-                    "cmake -S . -B build 2>&1 || (echo cmake_config_failed & exit /b 1)",
-                    "cmake --build build 2>&1 "
-                    "&& powershell -Command "
-                    '"Get-ChildItem -Recurse -Filter test_*.exe build | '
-                    'ForEach-Object { & $_.FullName } 2>&1"',
+                    "cmake -S . -B build -G \"MinGW Makefiles\" -DCMAKE_BUILD_TYPE=Release "
+                    "&& cmake --build build --config Release",
+                    "ctest --test-dir build --output-on-failure -C Release",
                 )
 
             return "echo OK", "bash run_tests.sh"
@@ -472,6 +470,27 @@ class TestAnalyzer:
         return (passed, failed) if found else None
 
     @staticmethod
+    def _parse_ctest_summary(output: str) -> tuple[int, int] | None:
+        """解析 CTest 汇总输出，返回 (passed, failed)。"""
+        import re
+
+        if re.search(r"No tests were found", output, re.IGNORECASE):
+            return (0, 0)
+
+        m = re.search(
+            r"\b\d+%\s+tests\s+passed"
+            r"(?:\s*,\s*(\d+)\s+tests?\s+failed)?"
+            r"\s+out\s+of\s+(\d+)\b",
+            output,
+            re.IGNORECASE,
+        )
+        if not m:
+            return None
+        failed = int(m.group(1) or 0)
+        total = int(m.group(2))
+        return (max(total - failed, 0), failed)
+
+    @staticmethod
     def _parse_gtest_summary(output: str) -> tuple[int, int] | None:
         """解析 Google Test 输出，支持多个二进制结果累加。"""
         import re
@@ -504,6 +523,12 @@ class TestAnalyzer:
         if parsed:
             passed, failed = parsed
             logger.debug(f"Parsed pytest output: {passed} passed, {failed} failed/errors")
+
+        if passed == 0 and failed == 0:
+            parsed = self._parse_ctest_summary(output)
+            if parsed:
+                passed, failed = parsed
+                logger.debug(f"Parsed CTest output: {passed} passed, {failed} failed")
 
         if passed == 0 and failed == 0:
             parsed = self._parse_gtest_summary(output)

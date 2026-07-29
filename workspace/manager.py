@@ -9,12 +9,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config.languages import get_target_extensions, normalize_language
+from config.languages import (
+    ARTIFACT_SKIP_PARTS,
+    COMMON_SKIP_DIRS,
+    INFRA_FILE_NAMES,
+    get_target_extensions,
+    get_test_extensions,
+    normalize_language,
+)
 from utils.logger import logger
 
 _SAFE_REMOVE_NAMES = {".source", ".source_staging"}
-_SAFE_IGNORE_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "__pycache__", ".pytest_cache"}
-_TREE_SKIP_DIRS = _SAFE_IGNORE_DIRS | {"node_modules", "build", "dist", "target", "CMakeFiles"}
+_SAFE_IGNORE_DIRS = COMMON_SKIP_DIRS | {"venv"}
+_TREE_SKIP_DIRS = COMMON_SKIP_DIRS
 
 
 def _resolve_within(root: Path, rel_path: str) -> Path:
@@ -31,6 +38,14 @@ def _resolve_within(root: Path, rel_path: str) -> Path:
 def _copytree_ignore(dir_path: str, names: list[str]) -> set[str]:
     """copytree ignore 回调：仅忽略非常确定的缓存/VCS 目录。"""
     return {name for name in names if name in _SAFE_IGNORE_DIRS}
+
+
+def _configured_test_extensions() -> set[str]:
+    """汇总所有已配置语言的测试扩展名。"""
+    exts: set[str] = set()
+    for language in ("python", "cpp", "c", "java", "csharp", "go", "rust", "javascript", "typescript"):
+        exts.update(ext.lower() for ext in get_test_extensions(language))
+    return exts
 
 
 def prepare_source_workspace(target_path: str, source_path: str,
@@ -71,7 +86,7 @@ def prepare_source_workspace(target_path: str, source_path: str,
             for item in tgt.iterdir():
                 if item.is_dir():
                     continue
-                if item.suffix.lower() not in (".cpp", ".py"):
+                if item.suffix.lower() not in _configured_test_extensions():
                     dst = Path(workspace_path) / item.name
                     shutil.copy2(str(item), str(dst))
             logger.info(f"  [Precheck] Target project files copied to workspace: {tgt}")
@@ -118,7 +133,7 @@ def assign_tests_to_layers(target_project_path: str,
         return stems
 
     test_layers: list[list[str]] = [[] for _ in source_layers]
-    test_patterns = ("*.cpp", "*.py")
+    test_patterns = tuple(f"*{ext}" for ext in sorted(_configured_test_extensions()))
 
     for pattern in test_patterns:
         for test_file in sorted(tgt.rglob(pattern)):
@@ -208,27 +223,16 @@ def copy_workspace_files(layer_files: list[str],
         _copy(rel_path)
 
     # 2) staging 中的非源码文件（只复制翻译/测试必需的基础设施）
-    _INFRA_NAMES = {
-        "run_tests.sh", "run_public_tests.sh",
-        "CMakeLists.txt", "Makefile",
-        "requirements.txt", "setup.py", "setup.cfg", "pyproject.toml",
-        "pytest.ini", "tox.ini", "conftest.py",
-        "Cargo.toml", "go.mod",
-        "package.json",
-    }
     for src_file in staging.rglob("*"):
         if src_file.is_dir():
             continue
         rel = str(src_file.relative_to(staging).as_posix())
-        if rel not in all_source_files and Path(rel).name in _INFRA_NAMES:
+        if rel not in all_source_files and Path(rel).name in INFRA_FILE_NAMES:
             _copy(rel)
 
 
 # 需跳过的文件/目录（测试代码和预构建脚手架不属于翻译产物）
-_SKIP_EXTRACT_PARTS = {"test", "tests", "public_test", "public_tests", "spec", "specs",
-                       "conftest.py", "run_tests.sh", "run_public_tests.sh",
-                       "__init__.py",  # precheck 生成的占位，非翻译产物
-                       "build", "_deps", "CMakeFiles", ".persist"}
+_SKIP_EXTRACT_PARTS = ARTIFACT_SKIP_PARTS
 
 
 def _should_skip_extract(rel_path: str) -> bool:
@@ -384,15 +388,19 @@ class LayerController:
     def active(self) -> bool:
         return bool(self.layers)
 
+    def target_layer(self, filepath: str) -> int | None:
+        """按目标文件 stem 推断所属源文件层；无法安全推断时返回 None。"""
+        if not self.active:
+            return None
+        return self._stem_map.get(Path(filepath).stem)
+
     def is_unlocked(self, filepath: str) -> bool:
         """检查文件是否在当前层或之前层。
 
         通过 stem 匹配 .h/.cpp 目标文件到对应层；重复的 stem 不做推断，
         避免根据错误的匹配把本可创建的翻译文件拦住。
         """
-        if not self.active:
-            return True
-        idx = self._stem_map.get(Path(filepath).stem)
+        idx = self.target_layer(filepath)
         if idx is None:
             return True  # 非项目文件或重复 stem 均放行
         return idx <= self.current

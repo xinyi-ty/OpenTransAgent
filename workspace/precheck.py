@@ -63,7 +63,7 @@ def _precheck_cpp(path: Path, name: str) -> list[str]:
     test_files = list(dict.fromkeys(test_files))
 
     cmake = path / "CMakeLists.txt"
-    if not cmake.exists() and not (path / "Makefile").exists():
+    if not cmake.exists():
         lines = [
             "cmake_minimum_required(VERSION 3.16)",
             f"project({safe} LANGUAGES CXX)",
@@ -78,9 +78,37 @@ def _precheck_cpp(path: Path, name: str) -> list[str]:
         if test_files:
             lines.extend([
                 "",
-                "# Google Test — 优先使用本地安装，找不到时再下载",
-                "find_package(GTest QUIET)",
-                "if(NOT GTest_FOUND)",
+                "# Google Test — prefer local install/source; remote fallback only as last resort",
+                "foreach(_gtest_prefix IN ITEMS",
+                "    $ENV{GTEST_ROOT}",
+                "    $ENV{GOOGLETEST_ROOT}",
+                "    D:/googletest/mingw-install",
+                "    D:/googletest/install",
+                "    D:/googletest",
+                "    D:/gtest/install",
+                "    D:/gtest",
+                ")",
+                "    if(_gtest_prefix)",
+                "        list(APPEND CMAKE_PREFIX_PATH \"${_gtest_prefix}\")",
+                "    endif()",
+                "endforeach()",
+                "find_package(GTest CONFIG QUIET)",
+                "if(NOT TARGET GTest::gtest_main)",
+                "    find_package(GTest QUIET)",
+                "endif()",
+                "if(NOT TARGET GTest::gtest_main AND EXISTS \"D:/googletest/src/CMakeLists.txt\")",
+                "    add_subdirectory(\"D:/googletest/src\" \"${CMAKE_BINARY_DIR}/_deps/googletest-local\")",
+                "elseif(NOT TARGET GTest::gtest_main AND EXISTS \"D:/googletest/CMakeLists.txt\")",
+                "    add_subdirectory(\"D:/googletest\" \"${CMAKE_BINARY_DIR}/_deps/googletest-local\")",
+                "elseif(NOT TARGET GTest::gtest_main AND EXISTS \"D:/gtest/src/CMakeLists.txt\")",
+                "    add_subdirectory(\"D:/gtest/src\" \"${CMAKE_BINARY_DIR}/_deps/gtest-local\")",
+                "elseif(NOT TARGET GTest::gtest_main AND EXISTS \"D:/gtest/CMakeLists.txt\")",
+                "    add_subdirectory(\"D:/gtest\" \"${CMAKE_BINARY_DIR}/_deps/gtest-local\")",
+                "endif()",
+                "if(NOT TARGET GTest::gtest_main AND TARGET GTest::Main)",
+                "    add_library(GTest::gtest_main ALIAS GTest::Main)",
+                "endif()",
+                "if(NOT TARGET GTest::gtest_main)",
                 "    include(FetchContent)",
                 "    FetchContent_Declare(",
                 "        googletest",
