@@ -189,6 +189,25 @@ logs/<model>/<project>_<source>_to_<target>_<timestamp>/
 | `TOPO_SORT_PATH` | 自动检测同级 `Code2Graph/` | Code2Graph 拓扑排序脚本路径 |
 | `TOOLCHAIN_PATHS` | 空 | 编译工具链额外路径，分号分隔 |
 
+### 按仓库规模与响应链路调优
+
+以下是推荐起点，**不是程序默认值**；实际还应考虑依赖层数、最大单文件和测试耗时。
+
+| 仓库规模 | MAX_ITERATIONS | STEPS_PER_ROUND | ROUND_TIMEOUT | SEARCH_MAX_RESULTS | TEST_TIMEOUT |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 小型（<=20 文件） | 20 | 40；复杂核心文件可 50 | 900 | 10 | 300 |
+| 中型（21-100 文件） | 40 | 30 | 1800 | 20 | 600 |
+| 大型（>100 文件） | 80 | 30 | 3600 | 30 | 1200 |
+
+模型响应链路建议：
+
+| 链路 | LLM_TIMEOUT | RUNTIME_ERROR_LIMIT | 说明 |
+| --- | ---: | ---: | --- |
+| 直联 / 低延迟 | 120 | 3 | 一般可使用程序默认值 |
+| 中转 / 高延迟 / 慢推理 | 300；极慢可 600 | 5 | `ROUND_TIMEOUT` 至少采用仓库规模建议，并显著大于单次 LLM 超时 |
+
+`LLM_TIMEOUT` 控制单次模型调用；`ROUND_TIMEOUT` 控制完整一次 `Conversation.run()` round，两者不能混用。编译型或慢测试项目可将 `TOOL_COMMAND_TIMEOUT` 提高到 120、`TEST_TIMEOUT` 提高到 600 或更高。`COMPLETENESS_RETRY_LIMIT`、`INVALID_RESPONSE_LIMIT` 建议保持 3，reflection/trace/redaction 建议保持开启。
+
 ---
 
 ## `run.py` 参数

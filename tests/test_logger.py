@@ -203,9 +203,18 @@ def test_trace_logger_generates_chinese_summary_and_index(tmp_path: Path) -> Non
     t.write("round_start")
     t.write("llm_request", payload={"message_count": 2, "tools": [{"name": "read_file"}]})
     t.write("llm_response", payload={"response_type": "tool_calls", "tool_calls": [{"name": "read_file"}]})
-    t.write("action_event", tool_name="create_file", action_data={"filepath": "main.cpp"})
-    t.write("action_event", tool_name="create_file", action_data={"filepath": "main.cpp"})
+    t.write("action_event", event_id="a1", tool_name="create_file", action_data={"filepath": "main.cpp"})
+    t.write("observation_event", action_id="a1", tool_name="create_file", is_error=False)
+    t.write("action_event", event_id="a2", tool_name="create_file", action_data={"filepath": "main.cpp"})
+    t.write("observation_event", action_id="a2", tool_name="create_file", is_error=False)
     t.write("action_event", tool_name="read_file", action_data={"filepath": "source.py"})
+    t.write("tool_advisory", payload={
+        "tool_name": "create_file",
+        "code": "repeated_full_rewrite",
+        "message": "prefer edit_file",
+        "filepath": "main.cpp",
+        "rewrite_count": 2,
+    })
     t.write("idle_nudge", payload={"reason": "no_files_created", "new_file_count": 0})
     t.write("completeness_check", payload={
         "layer": 0,
@@ -240,7 +249,9 @@ def test_trace_logger_generates_chinese_summary_and_index(tmp_path: Path) -> Non
         "compilation_success": True,
     })
     t.write("round_end", payload={"elapsed_s": 65})
-    t.write("run_end", payload={"elapsed_s": 70, "all_passed": True})
+    t.set_context(round_idx=2)
+    t.write("round_end", payload={"elapsed_s": 35})
+    t.write("run_end", payload={"elapsed_s": 110, "all_passed": True})
     t.close()
 
     assert t.summary_path.exists()
@@ -257,6 +268,11 @@ def test_trace_logger_generates_chinese_summary_and_index(tmp_path: Path) -> Non
     assert "`create_file`" in summary
     assert "`main.cpp`（2 次）" in summary
     assert "重复写入文件" in summary
+    assert "| Layer 0 | 2 |" in summary
+    assert "1分40秒" in summary
+    assert "重复全量覆盖提醒" in summary
+    assert index["schema_version"] == 2
+    assert index["advisory_counts"]["repeated_full_rewrite"] == 1
     assert "本次翻译成功完成" in summary
     assert index["event_counts"]["idle_nudge"] == 1
     assert index["summary_file"] == "translation_trace_summary.md"

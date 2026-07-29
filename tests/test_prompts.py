@@ -105,9 +105,12 @@ def test_dependency_layers_prompt_is_static_not_stale() -> None:
 def test_prompt_mentions_edit_file_for_precise_fixes() -> None:
     prompt = build_react_prompt("python", "cpp", "demo")
 
-    assert "## edit_file — Edit a workspace file by exact string replacement" in prompt
-    assert "use edit_file with an exact old_string/new_string replacement" in prompt
-    assert "Run focused checks when useful" in prompt
+    assert "## edit_file — Make a targeted exact replacement in an existing file; old_string must be non-empty" in prompt
+    assert "old_string MUST be non-empty" in prompt
+    assert "Use create_file for a new/empty file" in prompt
+    assert "do not rerun the same full test command unless relevant files changed" in prompt
+    assert "Avoid fragile patterns like `sys.path.insert(0, '..')`" in prompt
+    assert "package-relative imports" in prompt
 
 
 def test_reflection_guidelines_match_tool_schema() -> None:

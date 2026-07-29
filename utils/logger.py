@@ -147,6 +147,8 @@ class TranslationTraceLogger:
         self._summary_written = False
         self._recent_live_records: list[dict[str, Any]] = []
         self._last_live_write_count = 0
+        self._live_layer_rounds: dict[int, dict[str, float | int]] = {}
+        self._live_advisory_counts: dict[str, int] = {}
 
     # -- 运行时上下文（layer / round / step） ---------------------
 
@@ -165,7 +167,23 @@ class TranslationTraceLogger:
             if isinstance(event, ActionEvent):
                 self.write("action_event", **self._dump_action_event(event))
             elif isinstance(event, ObservationEvent):
-                self.write("observation_event", **self._dump_observation_event(event))
+                dumped = self._dump_observation_event(event)
+                self.write("observation_event", **dumped)
+                data = dumped.get("observation_data") or {}
+                advisory_code = data.get("advisory_code") if isinstance(data, dict) else None
+                if advisory_code:
+                    self.write("tool_advisory", payload={
+                        "tool_name": dumped.get("tool_name"),
+                        "action_id": dumped.get("action_id"),
+                        "tool_call_id": dumped.get("tool_call_id"),
+                        "code": advisory_code,
+                        "message": data.get("advisory_message"),
+                        "command": data.get("command"),
+                        "filepath": data.get("path"),
+                        "repeat_count": data.get("repeat_count"),
+                        "write_count": data.get("write_count"),
+                        "rewrite_count": data.get("rewrite_count"),
+                    })
             elif isinstance(event, MessageEvent):
                 self.write("message_event", **self._dump_message_event(event))
         except Exception:
@@ -227,16 +245,28 @@ class TranslationTraceLogger:
 
     def _update_live_report(self, record: dict[str, Any]) -> None:
         """运行中轻量刷新 translation_trace_live.md，避免等待结束才看到报告。"""
-        if record.get("event_type") in {
+        event_type = record.get("event_type")
+        payload = record.get("payload") or {}
+        layer = record.get("layer_idx")
+        if event_type == "round_end" and layer is not None:
+            elapsed = self._valid_elapsed(payload.get("elapsed_s"))
+            state = self._live_layer_rounds.setdefault(layer, {"round_count": 0, "elapsed_s": 0.0})
+            state["round_count"] = int(state["round_count"]) + 1
+            if elapsed is not None:
+                state["elapsed_s"] = float(state["elapsed_s"]) + elapsed
+        elif event_type == "tool_advisory":
+            code = str(payload.get("code") or "unknown")
+            self._live_advisory_counts[code] = self._live_advisory_counts.get(code, 0) + 1
+        if event_type in {
             "action_event", "observation_event", "llm_response", "test_analysis_result",
             "completeness_check", "idle_nudge", "invalid_response", "conversation_error",
-            "round_end", "layer_end", "run_end",
+            "tool_advisory", "round_end", "layer_end", "run_end",
         }:
             self._recent_live_records.append(record)
             self._recent_live_records = self._recent_live_records[-30:]
         key_events = {
             "test_analysis_result", "completeness_check", "idle_nudge", "invalid_response",
-            "conversation_error", "round_end", "layer_end", "run_end",
+            "conversation_error", "tool_advisory", "round_end", "layer_end", "run_end",
         }
         if record.get("event_type") in key_events or self._written_count - self._last_live_write_count >= 25:
             self._write_live_report()
@@ -267,9 +297,22 @@ class TranslationTraceLogger:
             f"- 已写入事件：{self._written_count}",
             f"- 最近事件：{last_event.get('event_type') if last_event else '-'}",
             "",
-            "## 最近完整性检查",
-            "",
         ]
+        if self._live_layer_rounds:
+            lines.extend([
+                "## 分层轮次耗时",
+                "",
+                "| 层 | 已完成轮次 | Round 耗时合计 |",
+                "| --- | ---: | ---: |",
+            ])
+            for layer, state in sorted(self._live_layer_rounds.items()):
+                lines.append(
+                    f"| Layer {layer} | {state['round_count']} | "
+                    f"{self._fmt_seconds(state['elapsed_s'])} |"
+                )
+            lines.extend(["", "## 最近完整性检查", ""])
+        else:
+            lines.extend(["## 最近完整性检查", ""])
         if latest_completeness:
             status = "通过" if latest_completeness.get("passed") else "失败"
             lines.extend([
@@ -292,6 +335,16 @@ class TranslationTraceLogger:
             ])
         else:
             lines.append("- 暂无测试结果。")
+        if self._live_advisory_counts:
+            lines.extend([
+                "",
+                "## 工具效率提醒",
+                "",
+                "| 类型 | 次数 |",
+                "| --- | ---: |",
+            ])
+            for code, count in sorted(self._live_advisory_counts.items()):
+                lines.append(f"| `{code}` | {count} |")
         lines.extend([
             "",
             "## 事件计数",
@@ -429,8 +482,13 @@ class TranslationTraceLogger:
         ]:
             if counts.get(key):
                 warnings.append(f"{label}: {counts[key]} 次")
+        advisory_counts: dict[str, int] = {}
+        for r in records:
+            if r.get("event_type") == "tool_advisory":
+                code = str((r.get("payload") or {}).get("code") or "unknown")
+                advisory_counts[code] = advisory_counts.get(code, 0) + 1
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": self._run_id,
             "project": self._project_name,
             "model": self._model,
@@ -439,6 +497,7 @@ class TranslationTraceLogger:
             "trace_file": self._path.name,
             "summary_file": self.summary_path.name,
             "event_counts": counts,
+            "advisory_counts": advisory_counts,
             "warnings": warnings,
         }
 
@@ -467,19 +526,19 @@ class TranslationTraceLogger:
             "",
             "## 2. 分层执行结果",
             "",
-            "| 层 | 解锁源码文件 | 新增测试文件 | 可见测试文件 | 测试模式 | 测试结果 | 耗时 |",
-            "| --- | ---: | ---: | ---: | --- | --- | ---: |",
+            "| 层 | 轮次 | 解锁源码文件 | 新增测试文件 | 可见测试文件 | 测试模式 | 测试结果 | Round 耗时合计 |",
+            "| --- | ---: | ---: | ---: | ---: | --- | --- | ---: |",
         ]
         if stats["layers"]:
             for layer, info in sorted(stats["layers"].items()):
                 lines.append(
-                    f"| Layer {layer} | {info.get('file_count', '-')} | "
+                    f"| Layer {layer} | {info.get('round_count', 0)} | {info.get('file_count', '-')} | "
                     f"{info.get('new_test_count', '-')} | {info.get('visible_test_count', '-')} | "
                     f"{self._test_scope_label(info.get('test_scope'))} | "
                     f"{info.get('tests', '-')} | {self._fmt_seconds(info.get('elapsed_s'))} |"
                 )
         else:
-            lines.append("| - | - | - | - | - | - | - |")
+            lines.append("| - | 0 | - | - | - | - | - | - |")
 
         lines.extend([
             "",
@@ -577,19 +636,20 @@ class TranslationTraceLogger:
             "",
             "## 8. 性能分析",
             "",
-            "| 层 | LLM 调用 | 平均 LLM 响应 | 最大 LLM 响应 | 层耗时 |",
-            "| --- | ---: | ---: | ---: | ---: |",
+            "| 层 | 轮次 | LLM 调用 | 平均 LLM 响应 | 最大 LLM 响应 | Round 耗时合计 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: |",
         ])
         for layer, info in sorted(stats["layers"].items()):
             latencies = info.get("llm_latencies", [])
             avg = sum(latencies) / len(latencies) if latencies else None
             max_latency = max(latencies) if latencies else None
             lines.append(
-                f"| Layer {layer} | {len(latencies)} | {self._fmt_seconds(avg)} | "
-                f"{self._fmt_seconds(max_latency)} | {self._fmt_seconds(info.get('elapsed_s'))} |"
+                f"| Layer {layer} | {info.get('round_count', 0)} | {len(latencies)} | "
+                f"{self._fmt_seconds(avg)} | {self._fmt_seconds(max_latency)} | "
+                f"{self._fmt_seconds(info.get('elapsed_s'))} |"
             )
         if not stats["layers"]:
-            lines.append("| - | 0 | - | - | - |")
+            lines.append("| - | 0 | 0 | - | - | - |")
 
         lines.extend([
             "",
@@ -608,10 +668,14 @@ class TranslationTraceLogger:
             "tool_counts": Counter(),
             "file_writes": Counter(),
             "llm_latencies": [],
+            "round_count": 0,
+            "elapsed_s": 0.0,
         })
         issues: Counter[str] = Counter()
+        advisory_counts: Counter[str] = Counter()
         completeness_checks: list[dict[str, Any]] = []
         llm_request_ts: dict[tuple[int | None, int | None], datetime] = {}
+        pending_write_actions: dict[Any, tuple[int | None, str]] = {}
         final_status = "未完成"
         final_tests = "未检测到测试结果"
         total_elapsed = None
@@ -649,11 +713,20 @@ class TranslationTraceLogger:
                     data = r.get("action_data") or {}
                     path = data.get("filepath") if isinstance(data, dict) else None
                     if path:
-                        file_writes[path] += 1
-                        if layer is not None:
-                            layers[layer]["file_writes"][path] += 1
-            elif et == "observation_event" and r.get("is_error"):
-                issues[f"工具返回错误：{r.get('tool_name') or 'unknown'}"] += 1
+                        pending_write_actions[r.get("event_id")] = (layer, path)
+            elif et == "observation_event":
+                action_id = r.get("action_id")
+                write = pending_write_actions.pop(action_id, None)
+                if write and not r.get("is_error"):
+                    write_layer, path = write
+                    file_writes[path] += 1
+                    if write_layer is not None:
+                        layers[write_layer]["file_writes"][path] += 1
+                if r.get("is_error"):
+                    issues[f"工具返回错误：{r.get('tool_name') or 'unknown'}"] += 1
+            elif et == "tool_advisory":
+                code = str(payload.get("code") or "unknown")
+                advisory_counts[code] += 1
             elif et == "invalid_response":
                 issues["无效 LLM 响应"] += 1
             elif et == "idle_nudge":
@@ -690,7 +763,10 @@ class TranslationTraceLogger:
                 layers[layer]["tests"] = tests
                 final_tests = tests
             elif et == "round_end" and layer is not None:
-                layers[layer]["elapsed_s"] = payload.get("elapsed_s")
+                layers[layer]["round_count"] += 1
+                elapsed = self._valid_elapsed(payload.get("elapsed_s"))
+                if elapsed is not None:
+                    layers[layer]["elapsed_s"] += elapsed
             elif et == "run_end":
                 total_elapsed = payload.get("elapsed_s")
                 if payload.get("all_passed"):
@@ -698,17 +774,41 @@ class TranslationTraceLogger:
                 else:
                     final_status = payload.get("exit_reason") or "未完全通过"
 
+        # 完整性全部通过 + 非失败原因 → 视作翻译成功，仅注明测试情况
+        completeness_all_passed = (
+            completeness_checks and all(c.get("passed") for c in completeness_checks)
+        )
+        if completeness_all_passed and final_status not in {"成功"}:
+            if final_status == "no_tests":
+                final_status = "成功（无测试验证）"
+            elif not any(
+                r.get("event_type") in {"conversation_error", "llm_error"}
+                for r in records
+            ):
+                final_status = "成功（完整性通过）"
+
         return {
             "event_counts": event_counts,
             "tool_counts": tool_counts,
             "file_writes": file_writes,
             "layers": dict(layers),
             "issues": issues,
+            "advisory_counts": advisory_counts,
             "completeness_checks": completeness_checks,
             "final_status": final_status,
             "final_tests": final_tests,
             "total_elapsed": total_elapsed,
         }
+
+    @staticmethod
+    def _valid_elapsed(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            elapsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return elapsed if elapsed >= 0 else None
 
     @staticmethod
     def _fmt_seconds(value: Any) -> str:
@@ -795,6 +895,13 @@ class TranslationTraceLogger:
         rows = []
         for issue, count in stats["issues"].most_common():
             rows.append(f"| {issue} | {count} | 请结合 JSONL 原始日志定位具体上下文 |")
+        advisory_labels = {
+            "repeated_successful_command": "重复成功命令提醒",
+            "repeated_full_rewrite": "重复全量覆盖提醒",
+        }
+        for code, count in stats.get("advisory_counts", {}).most_common():
+            label = advisory_labels.get(code, f"工具效率提醒：{code}")
+            rows.append(f"| {label} | {count} | 优化建议，不影响工具执行结果 |")
         duplicate_count = sum(1 for c in stats["file_writes"].values() if c > 1)
         if duplicate_count:
             rows.append(f"| 重复写入文件 | {duplicate_count} | 可能存在多轮修正或整文件覆盖，可关注效率 |")
@@ -807,8 +914,17 @@ class TranslationTraceLogger:
         llm_calls = stats["event_counts"].get("llm_request", 0)
         tool_calls = sum(stats["tool_counts"].values())
         missing = self._final_missing_items(stats)
+        completeness_all_passed = not missing and stats["completeness_checks"] and all(
+            c.get("passed") for c in stats["completeness_checks"]
+        )
         if status == "成功":
             result = f"本次翻译成功完成，最终测试结果为 {tests}。"
+        elif completeness_all_passed and status in {"no_tests", "incomplete"}:
+            result = f"本次翻译成功完成（完整翻译了所有期望文件），但目标项目未提供测试用例，无法进行测试验证。"
+        elif "无测试验证" in status or "完整性通过" in status:
+            result = f"本次翻译成功完成（完整翻译了所有期望文件），但目标项目未提供测试用例，无法进行测试验证。"
+        elif completeness_all_passed:
+            result = f"本次翻译的完整性检查全部通过，但测试结果为 {tests}。"
         else:
             result = f"本次翻译未完全成功，最终状态为 {status}，测试结果为 {tests}。"
         completeness = (
@@ -860,6 +976,11 @@ class TranslationTraceLogger:
         if et == "completeness_feedback_sent":
             payload = r.get("payload", {})
             return prefix + f"已发送完整性补齐反馈：缺失 {payload.get('missing_count')} 个文件"
+        if et == "tool_advisory":
+            payload = r.get("payload", {})
+            target = payload.get("filepath") or payload.get("command") or payload.get("tool_name")
+            compact = " ".join(str(target or "").split())[:160]
+            return prefix + f"💡 工具效率提醒 `{payload.get('code')}`：{compact}"
         if et in {"round_start", "round_end", "layer_start", "layer_end", "run_start", "run_end", "feedback_sent", "conversation_error"}:
             return prefix + f"{et}"
         return ""

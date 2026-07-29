@@ -130,11 +130,16 @@ class CreateFileAction(Action):
 class CreateFileObservation(Observation):
     path: str = Field(default="")
     size: int = Field(default=0)
+    advisory_code: str = Field(default="")
+    advisory_message: str = Field(default="")
+    write_count: int = Field(default=0)
+    rewrite_count: int = Field(default=0)
 
 
 class CreateFileExecutor(ToolExecutor):
     def __init__(self, workspace_root: str = "."):
         self.root = Path(workspace_root).resolve()
+        self._successful_writes: dict[str, int] = {}
 
     def __call__(self, action, conversation=None):
         try:
@@ -155,10 +160,30 @@ class CreateFileExecutor(ToolExecutor):
                     is_error=True, path=rel, size=0)
 
         try:
+            existed_before = p.is_file()
             _atomic_write_text(p, action.content)
+            previous_writes = self._successful_writes.get(rel, 0)
+            write_count = previous_writes + 1
+            self._successful_writes[rel] = write_count
+            rewrite_count = max(0, write_count - 1) if previous_writes else (1 if existed_before else 0)
+            advisory_code = ""
+            advisory_message = ""
+            text = f"[OK] Created file: {rel} ({len(action.content)} chars)"
+            if rewrite_count >= 2:
+                advisory_code = "repeated_full_rewrite"
+                advisory_message = (
+                    f"This file has been fully rewritten {rewrite_count} times. "
+                    f"For another small correction, prefer edit_file with a precise non-empty "
+                    f"old_string; keep using create_file when a complete replacement is intentional."
+                )
+                text += f"\nAdvisory: {advisory_message}"
             return CreateFileObservation.from_text(
-                text=f"[OK] Created file: {rel} ({len(action.content)} chars)",
+                text=text,
                 path=rel, size=len(action.content),
+                advisory_code=advisory_code,
+                advisory_message=advisory_message,
+                write_count=write_count,
+                rewrite_count=rewrite_count,
             )
         except Exception as e:
             return CreateFileObservation.from_text(
@@ -167,7 +192,7 @@ class CreateFileExecutor(ToolExecutor):
 
 
 class CreateFileTool(ToolDefinition):
-    description: str = "创建/写入文件"
+    description: str = "创建新/空文件，或有意原子替换文件全部内容；小范围修改优先 edit_file"
 
     @classmethod
     def create(cls, conv_state=None, **kwargs):
@@ -179,8 +204,8 @@ register_tool("create_file", CreateFileTool)
 
 
 class EditFileAction(Action):
-    filepath: str = Field(description="要修改的文件路径")
-    old_string: str = Field(description="要替换的精确原文；默认必须唯一")
+    filepath: str = Field(description="要修改的已有文件路径")
+    old_string: str = Field(description="非空的精确原文；必须存在且默认唯一，空文件/全量替换请用 create_file")
     new_string: str = Field(description="替换后的文本")
     replace_all: bool = Field(default=False, description="是否替换所有匹配项")
 
@@ -255,7 +280,7 @@ class EditFileExecutor(ToolExecutor):
 
 
 class EditFileTool(ToolDefinition):
-    description: str = "Edit a workspace file by exact string replacement"
+    description: str = "对已有文件做精确局部替换；old_string 必须非空且默认唯一"
 
     @classmethod
     def create(cls, conv_state=None, **kwargs):

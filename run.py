@@ -670,17 +670,32 @@ def main():
                 exit_reason = "stuck"
                 break
             if status == ConversationExecutionStatus.ERROR:
-                logger.info(f"  ⚠️ Agent error")
-                exit_reason = "error"
-                break
+                # SDK 层内部错误（例如 agent 达到 max_iterations）通常是
+                # 可恢复的——只是本轮 steps 不够用，应进入下一轮继续而非直接终止。
+                logger.info(f"  ⚠️ Agent error (will retry in next round)")
+                conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                conv.send_message(
+                    "Continue translating. Do NOT call finish until all files are done."
+                )
+                continue
             if status == ConversationExecutionStatus.PAUSED:
-                logger.info(f"  ⚠️ Agent paused")
-                exit_reason = "stuck"
-                break
+                # SDK 内部暂停（例如被 interrupt 后未完全恢复），
+                # 尝试在下一轮继续，不直接终止。
+                logger.info(f"  ⚠️ Agent paused (will retry in next round)")
+                conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                conv.send_message(
+                    "Continue translating. Do NOT call finish until all files are done."
+                )
+                continue
             if status == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION:
-                logger.info(f"  ⚠️ Agent is waiting for confirmation")
-                exit_reason = "stuck"
-                break
+                # 当前配置使用 NeverConfirm，不应出现此状态；
+                # 若出现，尝试在下一轮恢复。
+                logger.info(f"  ⚠️ Agent is waiting for confirmation (will retry in next round)")
+                conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                conv.send_message(
+                    "Continue translating. Do NOT call finish until all files are done."
+                )
+                continue
             if status != ConversationExecutionStatus.FINISHED:
                 # 还没 finish → 检查是否有产出，避免空转
                 target_exts = get_target_extensions(args.target_language)

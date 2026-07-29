@@ -90,6 +90,35 @@ def test_create_file_returns_relative_path_and_overwrites_atomically(tmp_path: P
     assert (tmp_path / "src" / "out.py").read_text(encoding="utf-8") == "two"
 
 
+def test_create_file_advises_after_repeated_full_rewrites(tmp_path: Path) -> None:
+    executor = CreateFileExecutor(str(tmp_path))
+    first = executor(CreateFileAction(filepath="out.py", content="one"))
+    second = executor(CreateFileAction(filepath="out.py", content="two"))
+    third = executor(CreateFileAction(filepath="out.py", content="three"))
+
+    assert first.advisory_code == ""
+    assert second.advisory_code == ""
+    assert third.is_error is False
+    assert third.advisory_code == "repeated_full_rewrite"
+    assert third.write_count == 3
+    assert third.rewrite_count == 2
+    assert "prefer edit_file" in third.advisory_message
+    assert (tmp_path / "out.py").read_text(encoding="utf-8") == "three"
+
+
+def test_create_file_advisory_state_is_per_executor_and_path(tmp_path: Path) -> None:
+    first = CreateFileExecutor(str(tmp_path))
+    second = CreateFileExecutor(str(tmp_path))
+    for content in ("one", "two", "three"):
+        first(CreateFileAction(filepath="a.py", content=content))
+
+    other_path = first(CreateFileAction(filepath="b.py", content="one"))
+    other_executor = second(CreateFileAction(filepath="a.py", content="four"))
+
+    assert other_path.advisory_code == ""
+    assert other_executor.advisory_code == ""
+
+
 def test_create_file_layer_lock_uses_relative_path(tmp_path: Path) -> None:
     ctrl = DummyLayerCtrl(unlocked=False)
     set_layer_ctrl(ctrl)

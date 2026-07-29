@@ -28,7 +28,7 @@ You operate in a ReAct (Reasoning + Acting) loop:
 5. Mark complete when all tests pass"""
 
 IMPORTANT_NOTICE = """\
-IMPORTANT: You have exactly the tools listed below. Do NOT call tools that do not exist (e.g. "edit", "sed", "patch"). To create or fully rewrite a file, use create_file. To make a small targeted change to an existing file, use edit_file with an exact old_string/new_string replacement.
+IMPORTANT: You have exactly the tools listed below. Do NOT call tools that do not exist (e.g. "edit", "sed", "patch"). Use create_file for a new/empty file or an intentional full replacement. Use edit_file only for a targeted change in an existing file: old_string MUST be non-empty, match exact existing text, and be unique unless replace_all=true.
 
 AVAILABLE TOOLS:"""
 
@@ -40,7 +40,11 @@ TRANSLATION GUIDELINES:
 4. Prefer writing each target file once with a complete implementation. Avoid repeatedly overwriting the same file with tiny changes.
 5. Use edit_file for small, precise fixes to existing files; use create_file for new files or full rewrites.
 6. After creating files, update any build configuration files (e.g. CMakeLists.txt) to reference them.
-7. Run focused checks when useful, but do not repeatedly run the full test suite. Call finish after a coherent batch; the runtime will run cumulative regression tests and send feedback if anything fails.{reflection_guidelines}"""
+7. When translating to Python, generate correct import paths from the start:
+   - Prefer package-relative imports (e.g. `from .. import enum`) for files in subdirectories.
+   - Avoid fragile patterns like `sys.path.insert(0, '..')`; if sys.path is unavoidable,
+     use `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))` instead.
+8. Run focused checks when useful, but do not rerun the same full test command unless relevant files changed. Call finish after a coherent batch; the runtime will run cumulative regression tests and send feedback if anything fails.{reflection_guidelines}"""
 
 REFLECTION_GUIDELINES = """
 

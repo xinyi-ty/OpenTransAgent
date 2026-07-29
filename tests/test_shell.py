@@ -65,6 +65,48 @@ def test_execute_command_success(tmp_path) -> None:
     assert "$ python -c" in obs.text
 
 
+def test_repeated_successful_command_returns_advisory_without_blocking(tmp_path) -> None:
+    executor = ExecuteCommandExecutor(str(tmp_path))
+    action = ExecuteCommandAction(command="python -c \"print('ok')\"", timeout=10)
+
+    first = executor(action)
+    second = executor(action)
+
+    assert first.is_error is False
+    assert first.advisory_code == ""
+    assert second.is_error is False
+    assert second.exit_code == 0
+    assert second.advisory_code == "repeated_successful_command"
+    assert second.repeat_count == 2
+    assert "Advisory:" in second.text
+
+
+def test_workspace_change_resets_repeated_command_advisory(tmp_path) -> None:
+    executor = ExecuteCommandExecutor(str(tmp_path))
+    action = ExecuteCommandAction(command="python -c \"print('ok')\"", timeout=10)
+    executor(action)
+    (tmp_path / "source.py").write_text("x", encoding="utf-8")
+
+    after_change = executor(action)
+
+    assert after_change.is_error is False
+    assert after_change.advisory_code == ""
+    assert after_change.repeat_count == 1
+
+
+def test_command_advisory_state_is_executor_local(tmp_path) -> None:
+    action = ExecuteCommandAction(command="python -c \"print('ok')\"", timeout=10)
+    first = ExecuteCommandExecutor(str(tmp_path))
+    second = ExecuteCommandExecutor(str(tmp_path))
+    first(action)
+    first(action)
+
+    observation = second(action)
+
+    assert observation.advisory_code == ""
+    assert observation.repeat_count == 1
+
+
 def test_execute_command_timeout_preserves_partial_output(monkeypatch, tmp_path) -> None:
     def fake_run(*args, **kwargs):
         raise subprocess.TimeoutExpired(
