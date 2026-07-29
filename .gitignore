@@ -1,5 +1,7 @@
 # API 密钥配置
 .env
+.env.*
+!.env.template
 
 # Python
 __pycache__/
@@ -7,29 +9,33 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.coverage
+htmlcov/
 
-# 运行日志
+# 虚拟环境
+.venv/
+venv/
+
+# 运行日志与追踪日志
 logs/
 conversation_logs/
+*.log
+
+# 翻译工作区与输出
+workspace/
+target_output/
+target_space/
+.persist/
+.source/
+.source_staging/
 
 # IDE
 .idea/
 .vscode/
 *.swp
 
-# 批量翻译输出
-target_output/
-target_space/
-
-# 对话持久化数据
-.persist/
-
 # 系统文件
 Thumbs.db
 .DS_Store
-
-# 虚拟环境
-.venv/
-
 nul
-test

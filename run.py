@@ -3,22 +3,37 @@
 import argparse
 import concurrent.futures
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 os.environ.setdefault("PYTHONUTF8", "1")  # 强制 Python 子进程使用 UTF-8，避免 gbk 编码错误
 
-from utils.logger import logger, suppress_sdk_logging, setup_log_dir, save_prompt_to
+from utils.logger import logger, suppress_sdk_logging, setup_log_dir, save_prompt_to, TranslationTraceLogger
 suppress_sdk_logging()
 
-from config.sdk_path import ensure_openhands_importable
-ensure_openhands_importable()
-
-from config.settings import get_llm_config, get_max_iterations
+from config.settings import (
+    get_invalid_response_limit,
+    get_llm_config,
+    get_max_iterations,
+    get_reflection_enabled,
+    get_round_timeout,
+    get_runtime_error_limit,
+    get_search_max_results,
+    get_steps_per_round,
+    get_test_raw_output_limit,
+    get_test_timeout,
+    get_tool_command_timeout,
+    get_trace_log_enabled,
+    get_trace_log_max_field_chars,
+    get_trace_log_redact_secrets,
+)
 from openhands.sdk import LLM, Conversation, ConversationExecutionStatus
+from openhands.sdk.conversation.exceptions import ConversationRunError
 from agent.translation_agent import ReActTranslationAgent
 from workspace.manager import (prepare_source_workspace, get_project_tree,
                                extract_results, cleanup, get_topo_sort_order,
@@ -29,12 +44,6 @@ from workspace.precheck import run_precheck
 from analysis.test_analyzer import TestAnalysis, TestAnalyzer
 from config.languages import get_target_extensions
 from config.router import validate_pair
-
-# 每次外循环允许 agent 执行的最大 step 数。
-# 设太小 LLM 刚展开就暂停，设太大外循环失去意义。
-# 修改此值会影响 max_iterations 的实际步数上限（max_iter × STEPS_PER_ROUND）。
-STEPS_PER_ROUND = 50
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="OpenTransAgent - 仓库级代码翻译")
@@ -49,9 +58,33 @@ def parse_args():
     p.add_argument("--llm_model", default="")
     p.add_argument("--llm_api_key", default="")
     p.add_argument("--llm_base_url", default="")
-    p.add_argument("--llm_timeout", type=int, default=0)
-    p.add_argument("--max_iterations", type=int, default=0,
-                   help="最大外循环次数（每次外循环内 agent 可执行约 STEPS_PER_ROUND 步）")
+    p.add_argument("--llm_timeout", type=int, default=None)
+    p.add_argument("--max_iterations", type=int, default=None,
+                   help="最大外循环次数（每次外循环内 agent 可执行 steps_per_round 步）")
+    p.add_argument("--steps_per_round", type=int, default=None,
+                   help="每次外循环内 Agent 可执行的最大 step 数（默认 50）")
+    p.add_argument("--tool_command_timeout", type=int, default=None,
+                   help="execute_command 工具默认超时时间秒数（默认 60）")
+    p.add_argument("--search_max_results", type=int, default=None,
+                   help="search_content 工具默认最大结果数（默认 10）")
+    p.add_argument("--round_timeout", type=int, default=None,
+                   help="单轮 Conversation.run 超时时间秒数（默认 1800）")
+    p.add_argument("--test_timeout", type=int, default=None,
+                   help="测试分析超时时间秒数（默认 300）")
+    p.add_argument("--test_raw_output_limit", type=int, default=None,
+                   help="反馈给 LLM 的测试原始输出上限（默认 5000，0 表示不截断）")
+    p.add_argument("--no-reflection", action="store_true",
+                   help="禁用失败后的 reflect 反思纠错提示和工具")
+    p.add_argument("--invalid_response_limit", type=int, default=None,
+                   help="连续无效响应上限（默认 3）")
+    p.add_argument("--runtime_error_limit", type=int, default=None,
+                   help="连续可恢复运行时错误上限（默认 3）")
+    p.add_argument("--no_trace_log", action="store_true",
+                   help="禁用功能调用追踪日志")
+    p.add_argument("--trace_log_max_field_chars", type=int, default=None,
+                   help="追踪日志字段最大字符数（默认 20000）")
+    p.add_argument("--no_trace_redact", action="store_true",
+                   help="禁用追踪日志敏感字段 redaction")
     p.add_argument("--workspace_dir", default="./workspace")
     p.add_argument("--persistence_dir", default="")
     p.add_argument("--no-topo-sort", action="store_true",
@@ -59,7 +92,10 @@ def parse_args():
     return p.parse_args()
 
 
-def format_feedback(analysis: TestAnalysis | None) -> str:
+def format_feedback(
+    analysis: TestAnalysis | None,
+    reflection_enabled: bool = True,
+) -> str:
     """将测试分析结果格式化为给 LLM 的反馈消息。"""
     if analysis is None:
         return ("[SYSTEM: ITERATION COMPLETE]\n"
@@ -89,10 +125,129 @@ def format_feedback(analysis: TestAnalysis | None) -> str:
                      "Do NOT call finish until all tests pass.")
         if not analysis.compilation.success:
             lines.append("Fix compilation errors first, then logic errors.")
-        if analysis.raw_output and analysis.passed_tests == 0 and analysis.total_tests > 0:
+        if reflection_enabled:
+            lines.append(
+                "Before editing files, call reflect(source_function, translated_code, "
+                "error_message, test_results) to analyze the failure."
+            )
+        if analysis.raw_output and analysis.passed_tests < analysis.total_tests:
             lines.append(f"\nTest output:\n{analysis.raw_output}")
 
     return "\n".join(lines)
+
+
+def _quote_cmd_arg(value: str) -> str:
+    """为 shell=True 命令安全引用路径参数。"""
+    return subprocess.list2cmdline([value])
+
+
+def _build_layer_test_command(test_files: list[str], working_dir: str) -> str | None:
+    """按当前层测试文件构造测试命令，尽量避免未引用路径和无效 exe 路径。"""
+    root = Path(working_dir)
+    all_subcmds: list[str] = []
+    for tf in test_files:
+        if tf.endswith(".py"):
+            all_subcmds.append(f"python -m pytest {_quote_cmd_arg(tf)} -v 2>&1")
+            continue
+
+        stem = Path(tf).stem
+        paths = [
+            Path("build") / f"{stem}.exe",
+            Path("build") / "Debug" / f"{stem}.exe",
+            Path("build") / "Release" / f"{stem}.exe",
+        ]
+        existing = [str(p) for p in paths if (root / p).exists()]
+        if existing:
+            all_subcmds.extend(f"{_quote_cmd_arg(p)} 2>&1" for p in existing)
+        else:
+            all_subcmds.append(" || ".join(
+                f'if exist "{p}" "{p}"' for p in paths
+            ))
+
+    return " & ".join(all_subcmds) if all_subcmds else None
+
+
+def _is_retryable_runtime_error(exc: BaseException) -> bool:
+    """粗略判断 provider/网络错误是否适合在下一轮恢复重试。"""
+    text = str(exc).lower()
+    retryable = (
+        "rate limit", "ratelimit", "429", "overloaded", "timeout",
+        "timed out", "connection", "network", "temporar", "server error",
+        " 500", " 502", " 503", " 504",
+    )
+    fatal = (
+        "authentication", "unauthorized", "forbidden", "invalid api key",
+        "permission", "bad request", "invalid_request", "model not found",
+        "not found", "unsupported",
+    )
+    if any(marker in text for marker in fatal):
+        return False
+    return any(marker in text for marker in retryable)
+
+
+def _runtime_error_message(exc: BaseException) -> str:
+    if isinstance(exc, ConversationRunError):
+        return str(exc.original_exception)
+    return str(exc)
+
+
+def _request_conversation_stop(conv: Any) -> None:
+    """请求 SDK 停止当前 run；兼容没有 interrupt 的 Conversation 实现。"""
+    try:
+        interrupt = getattr(conv, "interrupt", None)
+        if callable(interrupt):
+            interrupt()
+            return
+        pause = getattr(conv, "pause", None)
+        if callable(pause):
+            pause()
+            return
+    except Exception as exc:
+        logger.warning(f"  ⚠️  Failed to interrupt conversation: {str(exc)[:300]}")
+    try:
+        conv.state.execution_status = ConversationExecutionStatus.STUCK
+    except Exception:
+        pass
+
+
+def _run_conversation_with_timeout(
+    conv: Any,
+    timeout: float,
+    stop_wait_timeout: float = 10,
+) -> tuple[bool, bool]:
+    """运行一次 Conversation.run，返回 (是否完成, 超时后线程是否仍未停止)。"""
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(conv.run)
+    try:
+        future.result(timeout=timeout)
+        return True, False
+    except concurrent.futures.TimeoutError:
+        logger.warning(f"  ⏰ Round timed out after {timeout}s")
+        _request_conversation_stop(conv)
+        future.cancel()
+        try:
+            future.result(timeout=stop_wait_timeout)
+            return False, False
+        except concurrent.futures.TimeoutError:
+            logger.warning("  ⚠️  Conversation thread did not stop after interrupt; preserving workspace")
+            return False, True
+        except Exception:
+            return False, False
+    finally:
+        pool.shutdown(wait=False)
+
+
+def _safe_close_conversation(conv: Any | None) -> None:
+    """释放 SDK Conversation 资源，避免退出时遗留 file store / observability 资源。"""
+    if conv is None:
+        return
+    close = getattr(conv, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:
+        logger.warning(f"  ⚠️  Failed to close conversation: {str(exc)[:300]}")
 
 
 def main():
@@ -102,7 +257,19 @@ def main():
         return 1
     model, api_key, base_url, timeout = get_llm_config(args)
     max_iter = get_max_iterations(args)
+    steps_per_round = get_steps_per_round(args)
+    tool_command_timeout = get_tool_command_timeout(args)
+    search_max_results = get_search_max_results(args)
+    round_timeout = get_round_timeout(args)
+    test_timeout = get_test_timeout(args)
+    test_raw_output_limit = get_test_raw_output_limit(args)
+    reflection_enabled = get_reflection_enabled(args)
+    invalid_response_limit = get_invalid_response_limit(args)
+    runtime_error_limit = get_runtime_error_limit(args)
     persistence = args.persistence_dir or None
+    trace_log_enabled = get_trace_log_enabled(args)
+    trace_log_max_field_chars = get_trace_log_max_field_chars(args)
+    trace_log_redact = get_trace_log_redact_secrets(args)
     source_dir = Path(args.source_path)
     # 自动提取 project_name（未指定时取 source_path 的上级目录名）
     project_name = args.project_name or source_dir.parent.name
@@ -116,7 +283,14 @@ def main():
     logger.info(f"📁 Project: {project_name}")
     logger.info(f"🔄 Translation: {args.source_language} -> {args.target_language}")
     logger.info(f"📂 Output: {target}  |  Max outer iterations: {max_iter}"
-                f"  |  Steps per round: {STEPS_PER_ROUND}")
+                f"  |  Steps per round: {steps_per_round}"
+                f"  |  Total step budget: {max_iter * steps_per_round}")
+    logger.info(f"⚙️  Tool timeout: {tool_command_timeout}s"
+                f"  |  Search max results: {search_max_results}"
+                f"  |  Round timeout: {round_timeout}s"
+                f"  |  Test timeout: {test_timeout}s"
+                f"  |  Raw output limit: {test_raw_output_limit}"
+                f"  |  Reflection: {'on' if reflection_enabled else 'off'}")
     logger.info("-" * 50)
 
     # ── 自动检测 target_project_path ──────────────────────────
@@ -173,11 +347,18 @@ def main():
     tree = get_project_tree(source_ws)
 
     # ── Agent 初始化 ──────────────────────────────────────────
+    initial_source_files = layers[0] if layers else translation_order
     agent = ReActTranslationAgent.create(
-        llm=llm, workspace_root=source_ws, max_iterations=max_iter * STEPS_PER_ROUND,
+        llm=llm, workspace_root=source_ws,
+        max_iterations=max_iter * steps_per_round,
         project_name=project_name, source_language=args.source_language,
         target_language=args.target_language, project_tree=tree,
-        translation_order=translation_order, layer_ctrl=layer_ctrl)
+        translation_order=translation_order, layer_ctrl=layer_ctrl,
+        command_timeout=tool_command_timeout,
+        search_max_results=search_max_results,
+        reflection_enabled=reflection_enabled,
+        invalid_response_limit=invalid_response_limit,
+        source_files=initial_source_files)
 
     # ── 保存 System Prompt 到日志文件 ─────────────────────────
     log_dir = setup_log_dir(model, project_name,
@@ -185,14 +366,34 @@ def main():
     prompt_path = save_prompt_to(log_dir, agent.system_prompt)
     logger.info(f"💾 System prompt saved to: {prompt_path}")
 
+    # ── 功能调用追踪日志 ─────────────────────────────────────
+    trace_logger = None
+    if trace_log_enabled:
+        trace_logger = TranslationTraceLogger(
+            log_dir,
+            run_id=log_dir.name,
+            project_name=project_name,
+            model=model,
+            source_language=args.source_language,
+            target_language=args.target_language,
+            max_field_chars=trace_log_max_field_chars,
+            redact_secrets=trace_log_redact,
+        )
+        agent.trace_logger = trace_logger
+        logger.info(f"📝 Translation trace: {trace_logger.path}")
+
     # visualizer=None: 屏蔽 SDK 的 Rich 可视化输出
-    conv = Conversation(
-        agent=agent, workspace=source_ws,
-        max_iteration_per_run=STEPS_PER_ROUND,
-        persistence_dir=persistence, stuck_detection=True,
-        stuck_detection_thresholds={"action_observation": 5, "action_error": 3,
-                                     "monologue": 15, "alternating_pattern": 4},
-        visualizer=None)
+    conv_args: dict[str, Any] = {
+        "agent": agent, "workspace": source_ws,
+        "max_iteration_per_run": steps_per_round,
+        "persistence_dir": persistence, "stuck_detection": True,
+        "stuck_detection_thresholds": {"action_observation": 5, "action_error": 3,
+                                        "monologue": 15, "alternating_pattern": 4},
+        "visualizer": None,
+    }
+    if trace_logger:
+        conv_args["callbacks"] = [trace_logger.on_event]
+    conv = Conversation(**conv_args)
 
     # ── 外循环：按依赖层推进 ───────────────────────────────────
     total_start = datetime.now()
@@ -201,14 +402,33 @@ def main():
     conv.send_message(f"Translate this {args.source_language} project "
                       f"to {args.target_language}.")
 
+    if trace_logger:
+        trace_logger.write("run_start", payload={
+            "source_language": args.source_language,
+            "target_language": args.target_language,
+            "max_iter": max_iter,
+            "steps_per_round": steps_per_round,
+            "reflection_enabled": reflection_enabled,
+        })
+
     final_analysis = None
     all_passed = False
     no_tests = False
     exit_reason = None  # "passed" | "stuck" | "no_tests" | None
     layer_errors: list[str] = []  # 每层的测试报错信息，用于最后汇总
+    consecutive_runtime_errors = 0
+    conversation_thread_leaked = False
 
     for layer_idx in range(layer_count):
+        consecutive_runtime_errors = 0
         prev_file_count = 0  # 记录上一轮的文件数，判断 LLM 是否在产出
+        if trace_logger:
+            trace_logger.set_context(layer_idx=layer_idx)
+            trace_logger.write("layer_start", payload={
+                "layer": layer_idx,
+                "total_layers": layer_count,
+                "file_count": len(layers[layer_idx]) if layers else 0,
+            })
         if layer_idx > 0:
             # 解锁下一层：源文件 + 测试文件
             layer_ctrl.advance()
@@ -228,26 +448,84 @@ def main():
             logger.info("")
             logger.info(f"=== Layer {layer_idx} — Round {round_idx}/{max_iter} ===")
 
-            # ① SDK 内部跑 STEPS_PER_ROUND 步
+            if trace_logger:
+                trace_logger.set_context(round_idx=round_idx)
+                trace_logger.write("round_start", payload={
+                    "layer": layer_idx, "round": round_idx, "max_rounds": max_iter,
+                })
+
+            # ① SDK 内部跑 steps_per_round 步
             round_start = datetime.now()
-            round_timeout = 1800  # 30 分钟单轮安全上限（LLM_TIMEOUT=60 时足够）
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = pool.submit(conv.run)
             try:
-                future.result(timeout=round_timeout)
-            except concurrent.futures.TimeoutError:
-                logger.warning(f"  ⏰ Round timed out after {round_timeout}s")
-                conv.state.execution_status = ConversationExecutionStatus.STUCK
-                exit_reason = "stuck"
-            finally:
-                pool.shutdown(wait=False)  # 不等待可能卡住的线程
+                run_completed, thread_leaked = _run_conversation_with_timeout(conv, round_timeout)
+                if thread_leaked:
+                    conversation_thread_leaked = True
+                    exit_reason = "stuck"
+                    break
+                if not run_completed:
+                    conv.state.execution_status = ConversationExecutionStatus.STUCK
+                    exit_reason = "stuck"
+                else:
+                    consecutive_runtime_errors = 0
+            except ConversationRunError as e:
+                err = _runtime_error_message(e)
+                consecutive_runtime_errors += 1
+                logger.warning(f"  ⚠️  Conversation runtime error: {err[:300]}")
+                if trace_logger:
+                    trace_logger.write("conversation_error", payload={
+                        "error": err[:2000],
+                        "consecutive_errors": consecutive_runtime_errors,
+                        "retryable": _is_retryable_runtime_error(e.original_exception),
+                    })
+                if (_is_retryable_runtime_error(e.original_exception)
+                        and consecutive_runtime_errors < runtime_error_limit):
+                    conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                    conv.send_message(
+                        "The previous LLM/provider call failed due to a transient "
+                        "runtime error. Continue from the last successful action."
+                    )
+                    continue
+                exit_reason = "stuck" if _is_retryable_runtime_error(e.original_exception) else "error"
+                break
+            except Exception as e:
+                err = _runtime_error_message(e)
+                consecutive_runtime_errors += 1
+                logger.warning(f"  ⚠️  Runtime error: {err[:300]}")
+                if _is_retryable_runtime_error(e) and consecutive_runtime_errors < runtime_error_limit:
+                    conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                    conv.send_message(
+                        "The previous runtime step failed due to a transient error. "
+                        "Continue from the last successful action."
+                    )
+                    continue
+                exit_reason = "stuck" if _is_retryable_runtime_error(e) else "error"
+                break
             round_elapsed = (datetime.now() - round_start).total_seconds()
             logger.info(f"  ⏱️ Round time: {round_elapsed:.0f}s")
+
+            if trace_logger:
+                trace_logger.write("round_end", payload={
+                    "elapsed_s": round_elapsed,
+                    "exit_reason": exit_reason,
+                    "status": str(conv.state.execution_status) if conv.state else None,
+                })
 
             # ② LLM 还在工作中 → 不测试，直接下一轮
             status = conv.state.execution_status
             if status == ConversationExecutionStatus.STUCK:
                 logger.info(f"  ⚠️ Agent stuck")
+                exit_reason = "stuck"
+                break
+            if status == ConversationExecutionStatus.ERROR:
+                logger.info(f"  ⚠️ Agent error")
+                exit_reason = "error"
+                break
+            if status == ConversationExecutionStatus.PAUSED:
+                logger.info(f"  ⚠️ Agent paused")
+                exit_reason = "stuck"
+                break
+            if status == ConversationExecutionStatus.WAITING_FOR_CONFIRMATION:
+                logger.info(f"  ⚠️ Agent is waiting for confirmation")
                 exit_reason = "stuck"
                 break
             if status != ConversationExecutionStatus.FINISHED:
@@ -257,14 +535,24 @@ def main():
                     len(list(Path(source_ws).rglob(f"*{ext}")))
                     for ext in target_exts
                 )
+                idle_reason = None
                 if new_count > 0 and new_count <= prev_file_count and round_idx > 1:
+                    idle_reason = "no_new_files"
                     msg = ("Files have been created. Call finish now to run tests and verify your translation. "
                            "If tests fail, the results will show you what to fix.")
                 elif new_count <= 0 and round_idx > 1:
+                    idle_reason = "no_files_created"
                     msg = ("You have not created any files. Read a source file and immediately write its "
                            "translation with create_file. Do not spend steps exploring.")
                 else:
                     msg = "Continue working on the current layer. Call finish when all files are translated."
+                if trace_logger and idle_reason:
+                    trace_logger.write("idle_nudge", payload={
+                        "reason": idle_reason,
+                        "new_file_count": new_count,
+                        "prev_file_count": prev_file_count,
+                        "message": msg[:500],
+                    })
                 prev_file_count = new_count
                 if round_idx < max_iter and exit_reason is None:
                     conv.send_message(msg)
@@ -289,40 +577,35 @@ def main():
                         f"If you believe they are unnecessary, explain why."
                     )
                     conv.state.execution_status = ConversationExecutionStatus.RUNNING
-                    conv.run()  # 再给一轮机会
+                    run_completed, thread_leaked = _run_conversation_with_timeout(conv, round_timeout)
+                    if thread_leaked:
+                        conversation_thread_leaked = True
+                        exit_reason = "stuck"
+                        break
+                    if not run_completed:
+                        exit_reason = "stuck"
+                        break
                     continue
 
             # ④ LLM 调用了 finish → 跑测试验证这一层
             logger.info(f"  ✅ LLM finished layer. Running tests...")
             logger.info(f"  🧪 Analyzing test results...")
+            # 按层构建测试命令（支持 C++ 二进制 + Python pytest）
+            test_cmd = None
+            if test_layers and layer_idx < len(test_layers):
+                test_cmd = _build_layer_test_command(test_layers[layer_idx], source_ws)
+            if trace_logger:
+                trace_logger.write("test_analysis_start", payload={
+                    "layer": layer_idx,
+                    "test_command": test_cmd if test_cmd else "auto-detected",
+                })
             try:
-                # 按层构建测试命令（支持 C++ 二进制 + Python pytest）
-                test_cmd = None
-                if test_layers and layer_idx < len(test_layers):
-                    py_files = []
-                    exe_files = []
-                    for tf in test_layers[layer_idx]:
-                        if tf.endswith(".py"):
-                            py_files.append(tf)
-                        else:
-                            exe_files.append(tf)
-
-                    all_subcmds = []
-                    for tf in py_files:
-                        all_subcmds.append(f"python -m pytest {tf} -v 2>&1")
-                    for tf in exe_files:
-                        stem = Path(tf).stem
-                        paths = [f"build\\{stem}.exe",
-                                 f"build\\Debug\\{stem}.exe",
-                                 f"build\\Release\\{stem}.exe"]
-                        all_subcmds.append(" || ".join(
-                            f'if exist "{p}" "{p}"' for p in paths
-                        ))
-
-                    if all_subcmds:
-                        test_cmd = " & ".join(all_subcmds)
-                analyzer = TestAnalyzer(working_dir=source_ws, timeout=300,
-                                        test_command=test_cmd or None)
+                analyzer = TestAnalyzer(
+                    working_dir=source_ws,
+                    timeout=test_timeout,
+                    test_command=test_cmd or None,
+                    raw_output_limit=test_raw_output_limit,
+                )
                 analysis = analyzer.run_and_analyze()
                 final_analysis = analysis
 
@@ -356,6 +639,16 @@ def main():
                             if err_lines:
                                 layer_errors.extend(err_lines[:3])
 
+                    if trace_logger:
+                        trace_logger.write("test_analysis_result", payload={
+                            "compilation_success": analysis.compilation.success,
+                            "passed_tests": analysis.passed_tests,
+                            "total_tests": analysis.total_tests,
+                            "overall_pass_rate": analysis.overall_pass_rate,
+                            "modules": {n: {"passed": m.passed_tests, "total": m.total_tests}
+                                       for n, m in analysis.modules.items()},
+                        })
+
                     # 判断是否全部通过
                     if analysis.total_tests > 0 and analysis.passed_tests == analysis.total_tests:
                         if layer_idx == layer_count - 1:
@@ -383,14 +676,33 @@ def main():
 
             # ⑤ 构造反馈发给 LLM
             if round_idx < max_iter:
-                feedback = format_feedback(final_analysis)
+                feedback = format_feedback(final_analysis, reflection_enabled)
                 conv.send_message(feedback)
                 logger.info(f"  📨 Feedback sent to agent ({len(feedback)} chars)")
+                if trace_logger:
+                    trace_logger.write("feedback_sent", payload={
+                        "length": len(feedback),
+                        "reflection_enabled": reflection_enabled,
+                    })
 
         if exit_reason:
+            if trace_logger:
+                trace_logger.write("layer_end", payload={
+                    "layer": layer_idx, "exit_reason": exit_reason,
+                    "all_passed": all_passed,
+                })
             break
 
     total_elapsed = (datetime.now() - total_start).total_seconds()
+
+    if trace_logger:
+        trace_logger.write("run_end", payload={
+            "elapsed_s": total_elapsed,
+            "exit_reason": exit_reason,
+            "all_passed": all_passed,
+            "trace_records": trace_logger.written_count,
+        })
+        trace_logger.close()
 
     # ── 测试失败原因汇总 ────────────────────────────────────
     if layer_errors and not all_passed:
@@ -422,8 +734,16 @@ def main():
     logger.info("=" * 50)
 
     # ── 结果提取 ──────────────────────────────────────────────
-    files = extract_results(source_ws, target, args.target_language)
-    cleanup(source_ws)
+    files = []
+    if conversation_thread_leaked:
+        logger.warning(
+            "  ⚠️  Skipped result extraction, cleanup, and conversation close "
+            "because conversation thread is still running"
+        )
+    else:
+        files = extract_results(source_ws, target, args.target_language)
+        cleanup(source_ws)
+        _safe_close_conversation(conv)
 
     logger.info("-" * 50)
     if all_passed:

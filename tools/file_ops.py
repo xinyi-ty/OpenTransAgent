@@ -1,13 +1,16 @@
-"""文件读写工具：read_file, create_file"""
+"""文件读写工具：read_file, create_file, list_files。"""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from openhands.sdk.tool import Action, Observation, ToolExecutor, ToolDefinition, register_tool
 from pydantic import Field
 
 # ── 依赖层控制（仅用于 create_file，read_file 靠物理隔离）──
 _LAYER_CTRL = None
+_READ_TEXT_LIMIT = 5000
+_LIST_MAX_ENTRIES = 200
 
 
 def set_layer_ctrl(ctrl):
@@ -20,9 +23,50 @@ def _get_layer_ctrl():
 
 
 def _resolve_path(root: Path, filepath: str) -> Path:
-    """将文件路径解析为相对于工作区根的绝对路径。"""
+    """将文件路径解析为工作区内绝对路径，允许工作区内绝对路径但禁止越界。"""
+    workspace = root.resolve()
     p = Path(filepath)
-    return (root / p).resolve() if not p.is_absolute() else p.resolve()
+    resolved = p.resolve() if p.is_absolute() else (workspace / p).resolve()
+    try:
+        resolved.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError(f"路径超出工作区: {filepath}") from exc
+    return resolved
+
+
+def _to_rel(root: Path, path: Path) -> str:
+    """返回相对工作区的 POSIX 风格路径。"""
+    return path.relative_to(root).as_posix()
+
+
+def _read_text(path: Path) -> str:
+    """容错读取 UTF-8 文本。"""
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _preview_text(content: str, limit: int = _READ_TEXT_LIMIT) -> str:
+    """生成给 LLM 的截断预览。"""
+    if len(content) <= limit:
+        return content
+    return (
+        content[:limit]
+        + f"\n... (truncated {len(content) - limit} chars; full size {len(content)} chars)"
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """原子写入文本文件，减少中断时留下半文件的概率。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 class ReadFileAction(Action):
@@ -39,17 +83,24 @@ class ReadFileExecutor(ToolExecutor):
         self.root = Path(workspace_root).resolve()
 
     def __call__(self, action, conversation=None):
-        p = _resolve_path(self.root, action.filepath)
-        if not p.exists():
+        try:
+            p = _resolve_path(self.root, action.filepath)
+        except ValueError as e:
+            return ReadFileObservation.from_text(
+                text=str(e), is_error=True,
+                result="", filepath=action.filepath,
+            )
+        if not p.exists() or not p.is_file():
             return ReadFileObservation.from_text(
                 text=f"文件不存在: {action.filepath}", is_error=True,
                 result="", filepath=action.filepath,
             )
         try:
-            content = p.read_text(encoding="utf-8")
+            content = _read_text(p)
+            rel = _to_rel(self.root, p)
             return ReadFileObservation.from_text(
-                text=f"📄 {action.filepath}\n\n{content[:5000]}",
-                result=content, filepath=action.filepath,
+                text=f"📄 {rel}\n\n{_preview_text(content)}",
+                result=content, filepath=rel,
             )
         except Exception as e:
             return ReadFileObservation.from_text(
@@ -60,11 +111,12 @@ class ReadFileExecutor(ToolExecutor):
 
 class ReadFileTool(ToolDefinition):
     description: str = "读取文件内容"
+
     @classmethod
     def create(cls, conv_state=None, **kwargs):
         return [cls(action_type=ReadFileAction, observation_type=ReadFileObservation,
-                     executor=ReadFileExecutor(
-                         workspace_root=kwargs.get("workspace_root", ".")))]
+                    executor=ReadFileExecutor(
+                        workspace_root=kwargs.get("workspace_root", ".")))]
 
 
 register_tool("read_file", ReadFileTool)
@@ -85,35 +137,42 @@ class CreateFileExecutor(ToolExecutor):
         self.root = Path(workspace_root).resolve()
 
     def __call__(self, action, conversation=None):
-        p = _resolve_path(self.root, action.filepath)
+        try:
+            p = _resolve_path(self.root, action.filepath)
+        except ValueError as e:
+            return CreateFileObservation.from_text(
+                text=str(e), is_error=True, path=action.filepath, size=0,
+            )
+        rel = _to_rel(self.root, p)
 
         # 层检查：不能提前创建高层的文件
         ctrl = _get_layer_ctrl()
         if ctrl and ctrl.active:
-            try:
-                rel = str(p.relative_to(self.root).as_posix())
-            except ValueError:
-                rel = action.filepath
             if not ctrl.is_unlocked(rel):
                 return CreateFileObservation.from_text(
                     text=f"⛕ '{rel}' 属于更高依赖层，当前不可创建。"
                          f"先完成当前层所有文件并通过测试。",
-                    is_error=True, path=action.filepath, size=0)
+                    is_error=True, path=rel, size=0)
 
         try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(action.content, encoding="utf-8")
-            return CreateFileObservation.from_text(text=f"[OK] Created file: {action.filepath} ({len(action.content)} chars)", path=str(p), size=len(action.content))
+            _atomic_write_text(p, action.content)
+            return CreateFileObservation.from_text(
+                text=f"[OK] Created file: {rel} ({len(action.content)} chars)",
+                path=rel, size=len(action.content),
+            )
         except Exception as e:
-            return CreateFileObservation.from_text(text=f"创建文件失败: {e}", is_error=True, path=action.filepath, size=0)
+            return CreateFileObservation.from_text(
+                text=f"创建文件失败: {e}", is_error=True, path=rel, size=0,
+            )
 
 
 class CreateFileTool(ToolDefinition):
     description: str = "创建/写入文件"
+
     @classmethod
     def create(cls, conv_state=None, **kwargs):
         return [cls(action_type=CreateFileAction, observation_type=CreateFileObservation,
-                     executor=CreateFileExecutor(workspace_root=kwargs.get("workspace_root", ".")))]
+                    executor=CreateFileExecutor(workspace_root=kwargs.get("workspace_root", ".")))]
 
 
 register_tool("create_file", CreateFileTool)
@@ -137,18 +196,24 @@ class ListFilesExecutor(ToolExecutor):
         self.root = Path(workspace_root).resolve()
 
     def __call__(self, action, conversation=None):
-        target = self.root
-        if action.path and action.path != ".":
-            p = Path(action.path)
-            target = (self.root / p).resolve() if not p.is_absolute() else p.resolve()
+        try:
+            target = self.root if not action.path or action.path == "." else _resolve_path(self.root, action.path)
+        except ValueError as e:
+            return ListFilesObservation.from_text(
+                text=str(e), is_error=True,
+            )
         if not target.exists() or not target.is_dir():
             return ListFilesObservation.from_text(
                 text=f"目录不存在: {action.path}", is_error=True,
             )
         files, dirs = [], []
+        truncated = False
         try:
-            for entry in sorted(target.iterdir(), key=lambda x: x.name):
-                rel = str(entry.relative_to(self.root).as_posix())
+            for i, entry in enumerate(sorted(target.iterdir(), key=lambda x: x.name)):
+                if i >= _LIST_MAX_ENTRIES:
+                    truncated = True
+                    break
+                rel = _to_rel(self.root, entry)
                 if entry.is_dir():
                     dirs.append(rel + "/")
                 else:
@@ -157,7 +222,11 @@ class ListFilesExecutor(ToolExecutor):
             return ListFilesObservation.from_text(
                 text=f"列出目录失败: {e}", is_error=True,
             )
-        text = f"📁 {action.path}/  ({len(files)} files, {len(dirs)} subdirs)\n"
+        rel_target = "." if target == self.root else _to_rel(self.root, target)
+        text = f"📁 {rel_target}/  ({len(files)} files, {len(dirs)} subdirs"
+        if truncated:
+            text += f", truncated at {_LIST_MAX_ENTRIES} entries"
+        text += ")\n"
         if dirs:
             text += "\n  📂 " + "\n  📂 ".join(dirs)
         if files:
@@ -170,6 +239,7 @@ class ListFilesExecutor(ToolExecutor):
 
 class ListFilesTool(ToolDefinition):
     description: str = "列出工作区目录下的文件和子目录（不递归）"
+
     @classmethod
     def create(cls, conv_state=None, **kwargs):
         return [cls(

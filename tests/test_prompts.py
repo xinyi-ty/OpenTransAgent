@@ -1,0 +1,121 @@
+from __future__ import annotations
+
+from agent import prompts
+from agent.prompts import build_react_prompt
+from tools.registry import BUILTIN_TOOL_DEFINITIONS, TOOL_DEFINITIONS
+
+
+def test_tool_list_is_registry_driven_and_ordered() -> None:
+    tool_list = prompts._build_tool_list()
+    lines = tool_list.splitlines()
+    expected_names = list(TOOL_DEFINITIONS) + list(BUILTIN_TOOL_DEFINITIONS)
+
+    assert [line.split(" — ", 1)[0].removeprefix("## ") for line in lines] == expected_names
+    for name, desc in {**TOOL_DEFINITIONS, **BUILTIN_TOOL_DEFINITIONS}.items():
+        assert f"## {name} — {desc}" in tool_list
+
+
+def test_tool_list_cache_refreshes_when_registry_changes() -> None:
+    first = prompts._build_tool_list()
+    TOOL_DEFINITIONS["temporary_test_tool"] = "Temporary test tool"
+    try:
+        updated = prompts._build_tool_list()
+    finally:
+        del TOOL_DEFINITIONS["temporary_test_tool"]
+        prompts._build_tool_list()
+
+    assert "temporary_test_tool" not in first
+    assert "## temporary_test_tool — Temporary test tool" in updated
+
+
+def test_unknown_language_pair_uses_generic_fallback() -> None:
+    prompt = build_react_prompt("java", "go", "demo")
+
+    assert "Your task is to translate a java project to go." in prompt
+    assert "For each source file, create the equivalent go file" in prompt
+    assert "ENVIRONMENT:" not in prompt
+
+
+def test_translation_order_takes_precedence_over_project_tree() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        project_tree="noise.txt\nunused.py",
+        translation_order=["src/main.py"],
+    )
+
+    assert "  - src/main.cpp" in prompt
+    assert "  - unused.cpp" not in prompt
+    assert "  - noise.txt" not in prompt
+
+
+def test_source_files_take_precedence_over_translation_order() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        source_files=["explicit.py"],
+        translation_order=["ordered.py"],
+    )
+
+    assert "  - explicit.cpp" in prompt
+    assert "  - ordered.cpp" not in prompt
+
+
+def test_project_tree_fallback_filters_tree_formatting() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        project_tree="""demo
+├── src
+│   ├── main.py
+│   └── helper.py
+└── README.md
+
+2 directories, 3 files
+...""",
+    )
+
+    assert "  - main.cpp" in prompt
+    assert "  - helper.cpp" in prompt
+    assert "  - README.md" in prompt
+    assert "  - demo" not in prompt
+    assert "directories" not in prompt.split("FILES TO CREATE:", 1)[1]
+
+
+def test_dependency_layers_prompt_is_static_not_stale() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        layers=[["base.py"], ["app.py"]],
+        current_layer=0,
+    )
+
+    assert "DEPENDENCY LAYERS (2 layers):" in prompt
+    assert "Layer 0: base.py" in prompt
+    assert "Layer 1: app.py" in prompt
+    assert "You are currently on Layer 0" not in prompt
+    assert "→" not in prompt
+    assert "The runtime will announce which layer is currently unlocked" in prompt
+
+
+def test_reflection_guidelines_match_tool_schema() -> None:
+    prompt = build_react_prompt("python", "cpp", "demo")
+
+    assert "reflect(source_function, translated_code, error_message, test_results)" in prompt
+    assert "reflect(source, code, error_message)" not in prompt
+
+
+def test_reflection_guidelines_can_be_disabled() -> None:
+    prompt = build_react_prompt(
+        "python",
+        "cpp",
+        "demo",
+        reflection_enabled=False,
+    )
+
+    assert "Reflection-based Error Correction" not in prompt
+    assert "reflect(source_function" not in prompt

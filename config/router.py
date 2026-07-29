@@ -4,14 +4,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from config.languages import normalize_language
+
 # ═══════════════════════════════════════════════════════════════
 #  数据模型
 # ═══════════════════════════════════════════════════════════════
 
 
-@dataclass
+@dataclass(frozen=True)
 class TranslationRoute:
     """一个翻译方向（源→目标）的完整配置。"""
+
     pair: tuple[str, str]            # (source, target)
     prompt_pair_instruction: str     # prompt 中的翻译对指引
     prompt_env_restriction: str      # prompt 中的环境限制
@@ -26,7 +29,7 @@ class TranslationRoute:
 def _cpp_to_py_ext(f: str) -> str:
     """将 C++ 文件名映射为对应的 Python 文件名。"""
     p = Path(f)
-    if p.suffix in (".h", ".hpp", ".cpp", ".cxx"):
+    if p.suffix.lower() in (".h", ".hpp", ".hxx", ".cpp", ".cxx", ".cc"):
         return p.with_suffix(".py").as_posix()
     return f
 
@@ -34,7 +37,7 @@ def _cpp_to_py_ext(f: str) -> str:
 def _py_to_cpp_ext(f: str) -> str:
     """将 Python 文件名映射为对应的 C++ 文件名。"""
     p = Path(f)
-    if p.suffix == ".py":
+    if p.suffix.lower() == ".py":
         return p.with_suffix(".cpp").as_posix()
     return f
 
@@ -78,7 +81,7 @@ def get_route(
     source_language: str, target_language: str
 ) -> TranslationRoute | None:
     """获取指定翻译方向的路由配置，未注册时返回 None。"""
-    key = (source_language.lower(), target_language.lower())
+    key = (normalize_language(source_language), normalize_language(target_language))
     return ROUTES.get(key)
 
 

@@ -9,8 +9,28 @@ import subprocess
 import sys
 from pathlib import Path
 
-from config.languages import get_target_extensions
+from config.languages import get_target_extensions, normalize_language
 from utils.logger import logger
+
+_SAFE_REMOVE_NAMES = {".source", ".source_staging"}
+_SAFE_IGNORE_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "__pycache__", ".pytest_cache"}
+_TREE_SKIP_DIRS = _SAFE_IGNORE_DIRS | {"node_modules", "build", "dist", "target", "CMakeFiles"}
+
+
+def _resolve_within(root: Path, rel_path: str) -> Path:
+    """解析 root 内路径，防止 ../ 越界。"""
+    base = root.resolve()
+    resolved = (base / rel_path).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError as exc:
+        raise ValueError(f"路径超出工作区: {rel_path}") from exc
+    return resolved
+
+
+def _copytree_ignore(dir_path: str, names: list[str]) -> set[str]:
+    """copytree ignore 回调：仅忽略非常确定的缓存/VCS 目录。"""
+    return {name for name in names if name in _SAFE_IGNORE_DIRS}
 
 
 def prepare_source_workspace(target_path: str, source_path: str,
@@ -31,13 +51,15 @@ def prepare_source_workspace(target_path: str, source_path: str,
     workspace_path = str(Path(target_path) / ".source")
     staging_path = str(Path(target_path) / ".source_staging")
     src = Path(source_path).resolve()
+    if not src.exists() or not src.is_dir():
+        raise FileNotFoundError(f"源项目目录不存在: {source_path}")
 
     for d in (workspace_path, staging_path):
         if Path(d).exists():
             _force_rmtree(d)
 
     # 全部源码 → staging（LLM 不可见，按层逐步加入 workspace）
-    shutil.copytree(src, staging_path)
+    shutil.copytree(src, staging_path, ignore=_copytree_ignore)
 
     # 空工作区，创建后填充内容
     Path(workspace_path).mkdir(parents=True)
@@ -80,19 +102,18 @@ def assign_tests_to_layers(target_project_path: str,
         """从文件内容中提取所有依赖的源文件 stem。"""
         stems: set[str] = set()
         if ext == ".cpp":
-            # C++: #include "header.h"
-            for m in re.finditer(r'#include\s+"([^"]+)"', content):
+            for m in re.finditer(r'#\s*include\s*[<"]([^">]+)[">]', content):
                 stems.add(Path(m.group(1)).stem)
         elif ext == ".py":
-            # Python: import module / from module import name
             for m in re.finditer(
-                r'^(?:from\s+([.\w]+)\s+import|import\s+(\w+(?:\.\w+)*))',
+                r'^(?:from\s+([.\w]+)\s+import|import\s+([\w.]+))',
                 content, re.MULTILINE,
             ):
                 mod = m.group(1) or m.group(2)
-                # 剥离相对导入前缀（from .module → module）
                 mod = mod.lstrip(".")
-                # 取最末段（from BeastHttp.base.cb → cb）
+                parts = mod.split(".")
+                for p in parts:
+                    stems.add(p)
                 stems.add(mod.split(".")[-1])
         return stems
 
@@ -125,9 +146,12 @@ def copy_test_layer(test_files: list[str],
     tgt = Path(target_project_path)
     ws = Path(workspace_path)
     for rel in test_files:
-        src = tgt / rel
+        try:
+            src = _resolve_within(tgt, rel)
+        except ValueError:
+            continue
         if src.exists():
-            dst = ws / rel
+            dst = _resolve_within(ws, rel)
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(src), str(dst))
 
@@ -139,11 +163,14 @@ def copy_source_files(layer_files: list[str],
     staging = Path(staging_path)
     workspace = Path(workspace_path)
     for rel_path in layer_files:
-        src = staging / rel_path
+        try:
+            src = _resolve_within(staging, rel_path)
+        except ValueError:
+            continue
         if src.exists():
-            dst = workspace / rel_path
+            dst = _resolve_within(workspace, rel_path)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            shutil.copy2(str(src), str(dst))
 
 
 def copy_workspace_files(layer_files: list[str],
@@ -228,13 +255,19 @@ def extract_results(source_workspace: str, target_path: str, target_language: st
                 continue
             dst = Path(target_path) / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            dst.write_text(src.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
             moved.append(str(rel))
     return moved
 
 
 def _force_rmtree(path: str):
-    """递归删除目录，遇到只读文件时先解除只读属性。"""
+    """递归删除目录，遇到只读文件时先解除只读属性。
+
+    只允许删除 .source / .source_staging 目录，防止误删无关数据。
+    """
+    if Path(path).name not in _SAFE_REMOVE_NAMES:
+        logger.warning(f"拒绝删除非工作区目录: {path}")
+        return
     for root, dirs, files in os.walk(path):
         for f in files:
             p = os.path.join(root, f)
@@ -267,8 +300,9 @@ def get_topo_sort_order(source_path: str, source_language: str) -> dict | None:
 
     失败或语言不支持时返回 None，不中断翻译流程。
     """
-    lang_map = {"python": "python", "cpp": "cpp", "c": "cpp", "c++": "cpp"}
-    lang = lang_map.get(source_language.lower())
+    lang_key = normalize_language(source_language)
+    lang_map = {"python": "python", "cpp": "cpp", "c": "cpp"}
+    lang = lang_map.get(lang_key)
     if lang is None or not TOPO_SORT_SCRIPT or not TOPO_SORT_SCRIPT.is_file():
         return None
 
@@ -305,8 +339,10 @@ def compute_layers(translation_order: list[str],
     all_files = set(translation_order)
     deps: dict[str, set[str]] = {f: set() for f in translation_order}
     for d in dependencies:
-        if d["file"] in all_files and d["depends_on"] in all_files:
-            deps.setdefault(d["file"], set()).add(d["depends_on"])
+        file = d.get("file")
+        dep = d.get("depends_on")
+        if file and dep and file in all_files and dep in all_files:
+            deps.setdefault(file, set()).add(dep)
 
     layers = []
     remaining = set(translation_order)
@@ -329,11 +365,20 @@ class LayerController:
     def __init__(self, layers: list[list[str]] | None = None):
         self.layers = layers or []
         self.current = 0
-        # 文件名（不含后缀）→ 层号，用于识别 core.h 属于 core.py 的层
-        self._stem_map: dict[str, int] = {}
+        # stem → 层号；只对无冲突的 stem 生效
+        _stem_to_layer: dict[str, int] = {}
         for i, layer in enumerate(self.layers):
             for f in layer:
-                self._stem_map[Path(f).stem] = i
+                _stem_to_layer[Path(f).stem] = i
+        _stem_counts: dict[str, int] = {}
+        for i, layer in enumerate(self.layers):
+            for f in layer:
+                s = Path(f).stem
+                _stem_counts[s] = _stem_counts.get(s, 0) + 1
+        self._stem_map: dict[str, int] = {}
+        for s, count in _stem_counts.items():
+            if count == 1:
+                self._stem_map[s] = _stem_to_layer[s]
 
     @property
     def active(self) -> bool:
@@ -342,15 +387,14 @@ class LayerController:
     def is_unlocked(self, filepath: str) -> bool:
         """检查文件是否在当前层或之前层。
 
-        同时识别 .h/.cpp 目标文件——operations.h 的 stem 是 operations，
-        会匹配到 operations.py 所在的层。
+        通过 stem 匹配 .h/.cpp 目标文件到对应层；重复的 stem 不做推断，
+        避免根据错误的匹配把本可创建的翻译文件拦住。
         """
         if not self.active:
             return True
-        stem = Path(filepath).stem
-        idx = self._stem_map.get(stem)
+        idx = self._stem_map.get(Path(filepath).stem)
         if idx is None:
-            return True  # 非项目文件始终可访问
+            return True  # 非项目文件或重复 stem 均放行
         return idx <= self.current
 
     def advance(self) -> bool:
@@ -373,13 +417,58 @@ def get_project_tree(project_path: str, max_depth: int = 3) -> str:
             return r.stdout
     except Exception:
         pass
-    lines = []
-    for i, f in enumerate(Path(project_path).rglob("*")):
-        if i >= 50:
+    # 纯 Python fallback：按深度限制，跳过无关目录，POSIX 路径
+    root = Path(project_path)
+    lines: list[str] = []
+    count = 0
+    limit = 200
+    for f in root.glob("*"):
+        if count >= limit:
             lines.append("...")
             break
+        skip = False
+        for part in f.relative_to(root).parts:
+            if part in _TREE_SKIP_DIRS:
+                skip = True
+                break
+        if skip:
+            continue
         try:
-            lines.append(str(f.relative_to(Path(project_path))))
+            rel = str(f.relative_to(root).as_posix())
         except ValueError:
             continue
+        lines.append(rel)
+        count += 1
+        if f.is_dir() and max_depth > 1:
+            for sub in _walk_dir(f, depth=1, max_depth=max_depth, remaining=limit - count, root=root):
+                lines.append(sub)
+                count += 1
+                if count >= limit:
+                    lines.append("...")
+                    break
     return "\n".join(lines)
+
+
+def _walk_dir(dir_path: Path, depth: int, max_depth: int, remaining: int, root: Path) -> list[str]:
+    lines: list[str] = []
+    for f in sorted(dir_path.iterdir()):
+        if remaining <= 0:
+            break
+        skip = False
+        for part in f.relative_to(root).parts:
+            if part in _TREE_SKIP_DIRS:
+                skip = True
+                break
+        if skip:
+            continue
+        try:
+            rel = str(f.relative_to(root).as_posix())
+        except ValueError:
+            continue
+        lines.append(rel)
+        remaining -= 1
+        if f.is_dir() and depth < max_depth:
+            sub = _walk_dir(f, depth + 1, max_depth, remaining, root)
+            lines.extend(sub)
+            remaining -= len(sub)
+    return lines

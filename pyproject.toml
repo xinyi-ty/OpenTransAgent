@@ -8,5 +8,14 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
 [project.scripts]
 opentrans = "run:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_classes = ["*Tests"]

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 from config.router import get_route
 from tools.registry import TOOL_DEFINITIONS, BUILTIN_TOOL_DEFINITIONS
 
@@ -36,29 +38,131 @@ TRANSLATION GUIDELINES:
 2. Start by reading a source file and creating its translation. Repeat for each file.
 3. {pair_instruction}
 4. After creating files, update any build configuration files (e.g. CMakeLists.txt) to reference them
-5. Run tests only after creating the translated code
+5. Run tests only after creating the translated code{reflection_guidelines}"""
+
+REFLECTION_GUIDELINES = """
 
 WHEN TESTS FAIL (Reflection-based Error Correction):
-1. First call reflect(source, code, error_message) to analyze root cause
+1. First call reflect(source_function, translated_code, error_message, test_results) to analyze root cause
 2. Use get_source_class_info / find_target_method etc. to gather needed context
 3. Only then call create_file to produce the fixed version"""
+
+_TREE_PREFIX_RE = re.compile(r"^[│| ]*(?:[├└]\s*──\s*)?")
+_TOOL_LIST_CACHE_KEY: tuple[tuple[str, str], ...] | None = None
+_TOOL_LIST_CACHE_VALUE = ""
 
 
 # ═══════════════════════════════════════════════════════════════
 #  辅助函数
 # ═══════════════════════════════════════════════════════════════
 
+def _tool_list_fingerprint() -> tuple[tuple[str, str], ...]:
+    """返回工具定义内容指纹，保持 registry 动态更新兼容性。"""
+    return (
+        tuple(TOOL_DEFINITIONS.items())
+        + tuple(BUILTIN_TOOL_DEFINITIONS.items())
+    )
+
+
 def _build_tool_list() -> str:
     """从 TOOL_DEFINITIONS 动态生成工具列表行（## name — desc）。"""
-    lines: list[str] = []
-    for name, desc in {**TOOL_DEFINITIONS, **BUILTIN_TOOL_DEFINITIONS}.items():
-        lines.append(f"## {name} — {desc}")
-    return "\n".join(lines)
+    global _TOOL_LIST_CACHE_KEY, _TOOL_LIST_CACHE_VALUE
+
+    fingerprint = _tool_list_fingerprint()
+    if fingerprint == _TOOL_LIST_CACHE_KEY:
+        return _TOOL_LIST_CACHE_VALUE
+
+    lines = [f"## {name} — {desc}" for name, desc in fingerprint]
+    _TOOL_LIST_CACHE_KEY = fingerprint
+    _TOOL_LIST_CACHE_VALUE = "\n".join(lines)
+    return _TOOL_LIST_CACHE_VALUE
 
 
 def _parse_project_files(project_tree: str) -> list[str]:
-    """将 project_tree 文本按行解析为文件路径列表。"""
-    return [f for f in project_tree.strip().split("\n") if f.strip()]
+    """将 project_tree 文本解析为尽量干净的文件路径列表。
+
+    project_tree 可能来自 tree 命令，也可能来自 fallback 的逐行路径列表。
+    这里保留旧的 fallback 能力，但过滤明显的展示性行，避免 FILES TO CREATE
+    混入树形符号、目录统计或省略号。
+    """
+    files: list[str] = []
+    for raw_line in project_tree.splitlines():
+        line = raw_line.strip()
+        if not line or line == "...":
+            continue
+        if re.match(r"^\d+ director", line) or re.match(r"^\d+ file", line):
+            continue
+
+        cleaned = _TREE_PREFIX_RE.sub("", line).strip()
+        if not cleaned or cleaned == "...":
+            continue
+        if cleaned.endswith(":"):
+            continue
+
+        # tree 输出中的目录通常没有后缀；fallback walk 输出通常包含路径分隔符。
+        # 这里宁可少推断，也避免把展示用目录行误当成待创建文件。
+        if "." not in cleaned and "/" not in cleaned and "\\" not in cleaned:
+            continue
+        files.append(cleaned.replace("\\", "/"))
+    return files
+
+
+def _select_source_files_for_targets(
+    source_files: list[str] | None,
+    translation_order: list[str] | None,
+    project_tree: str | None,
+) -> list[str] | None:
+    """选择用于生成 FILES TO CREATE 的源文件列表。"""
+    if source_files:
+        return source_files
+    if translation_order:
+        return translation_order
+    if project_tree:
+        return _parse_project_files(project_tree)
+    return None
+
+
+def _build_files_to_create_section(source_files: list[str], route) -> str:
+    """构建待创建文件段落。"""
+    target_files = (
+        [route.file_extension_map(f) for f in source_files]
+        if route and route.file_extension_map
+        else source_files
+    )
+    return "FILES TO CREATE:\n" + "\n".join(f"  - {f}" for f in target_files)
+
+
+def _build_dependency_layers_section(
+    layers: list[list[str]],
+    current_layer: int,
+) -> str:
+    """构建静态依赖层段落，避免 system prompt 中的当前层信息过期。"""
+    _ = current_layer  # 保留参数兼容性；当前层由运行时消息宣布。
+    total = len(layers)
+    layer_lines = "\n".join(
+        f"  Layer {i}: {', '.join(layer)}"
+        for i, layer in enumerate(layers)
+    )
+    return (
+        f"DEPENDENCY LAYERS ({total} layers):\n"
+        f"{layer_lines}\n\n"
+        f"The runtime will announce which layer is currently unlocked. "
+        f"Only work on the current unlocked layer and earlier layers. "
+        f"Higher layers are unlocked by runtime messages after tests pass."
+    )
+
+
+def _build_translation_order_section(translation_order: list[str]) -> str:
+    """构建依赖优先的建议翻译顺序段落。"""
+    order_lines = "\n".join(
+        f"  {i+1}. {f}" for i, f in enumerate(translation_order)
+    )
+    return (
+        f"SUGGESTED TRANSLATION ORDER (dependency-first):\n"
+        f"{order_lines}\n\n"
+        f"Files with no dependencies are listed first. Following this order\n"
+        f"helps avoid missing-dependency errors. Start from the top."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,6 +177,8 @@ def build_react_prompt(
     translation_order: list[str] | None = None,
     layers: list[list[str]] | None = None,
     current_layer: int = 0,
+    source_files: list[str] | None = None,
+    reflection_enabled: bool = True,
 ) -> str:
     """构建完整的 ReAct 翻译系统提示。
 
@@ -107,51 +213,32 @@ def build_react_prompt(
         if route
         else f"For each source file, create the equivalent {target_language} file"
     )
-    sections.append(GUIDELINES.format(pair_instruction=pair_instruction))
+    reflection_guidelines = REFLECTION_GUIDELINES if reflection_enabled else ""
+    sections.append(
+        GUIDELINES.format(
+            pair_instruction=pair_instruction,
+            reflection_guidelines=reflection_guidelines,
+        )
+    )
 
     # ── 4. 项目文件树 ──────────────────────────────────────────
     if project_tree:
         sections.append(f"PROJECT FILES:\n{project_tree}")
 
     # ── 5. 待生成的目标文件 ────────────────────────────────────
-    # 优先用 translation_order（仅源文件），避免基础设施文件混入
-    source_files = translation_order or (
-        _parse_project_files(project_tree) if project_tree else None
+    # 优先用显式源文件/translation_order，避免展示性 project_tree 混入。
+    selected_source_files = _select_source_files_for_targets(
+        source_files=source_files,
+        translation_order=translation_order,
+        project_tree=project_tree,
     )
-    if source_files:
-        target_files = (
-            [route.file_extension_map(f) for f in source_files]
-            if route and route.file_extension_map
-            else source_files
-        )
-        sections.append(
-            "FILES TO CREATE:\n" + "\n".join(f"  - {f}" for f in target_files)
-        )
+    if selected_source_files:
+        sections.append(_build_files_to_create_section(selected_source_files, route))
 
     # ── 6. 依赖层 / 翻译顺序 ───────────────────────────────────
     if layers:
-        total = len(layers)
-        layer_lines = "\n".join(
-            f"  {'→ ' if i == current_layer else '  '}"
-            f"Layer {i}: {', '.join(layer)}"
-            for i, layer in enumerate(layers)
-        )
-        sections.append(
-            f"DEPENDENCY LAYERS ({total} layers):\n"
-            f"{layer_lines}\n\n"
-            f"You are currently on Layer {current_layer}. Files in higher layers "
-            f"cannot be read yet. Finish the current layer and tests will unlock "
-            f"the next layer automatically."
-        )
+        sections.append(_build_dependency_layers_section(layers, current_layer))
     elif translation_order:
-        order_lines = "\n".join(
-            f"  {i+1}. {f}" for i, f in enumerate(translation_order)
-        )
-        sections.append(
-            f"SUGGESTED TRANSLATION ORDER (dependency-first):\n"
-            f"{order_lines}\n\n"
-            f"Files with no dependencies are listed first. Following this order\n"
-            f"helps avoid missing-dependency errors. Start from the top."
-        )
+        sections.append(_build_translation_order_section(translation_order))
 
     return "\n\n".join(sections)

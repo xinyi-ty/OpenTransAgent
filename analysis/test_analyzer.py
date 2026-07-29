@@ -77,7 +77,7 @@ class TestAnalyzer:
       - 可继承此类，实现不同语言的测试命令和解析逻辑
       - compile_command / test_command / extra_paths / raw_output_limit 均可配置
       - 工具链路径自动检测（shutil.which + 常见安装位置），也可通过
-        extra_paths 参数或 OPENHANDS_TOOLCHAIN_PATHS 环境变量显式覆盖
+        extra_paths 参数或 TOOLCHAIN_PATHS 环境变量显式覆盖
     """
 
     # ── 常见工具链安装路径（用于自动检测，支持 %VAR% 环境变量） ──
@@ -114,7 +114,7 @@ class TestAnalyzer:
             compile_command: 编译命令（空则自动检测）
             test_command: 测试命令（空则自动检测）
             timeout: 编译/测试超时秒数
-            extra_paths: 额外工具链路径（None 则读取 OPENHANDS_TOOLCHAIN_PATHS 环境变量，再退回到空列表）
+            extra_paths: 额外工具链路径（None 则读取 TOOLCHAIN_PATHS 环境变量，再退回到空列表）
             raw_output_limit: 保存给 LLM 的原始输出上限（0 表示不截断）
         """
         self.working_dir = Path(working_dir).resolve()
@@ -227,10 +227,21 @@ class TestAnalyzer:
     def _build_env_with_toolchain(self) -> dict[str, str]:
         """构建含工具链路径的进程环境变量。"""
         env = os.environ.copy()
-        extra = [
-            p for p in self._extra_paths
-            if os.path.isdir(p) and p not in env.get("PATH", "")
-        ]
+        path_entries = env.get("PATH", "").split(os.pathsep)
+        normalized = {
+            os.path.normcase(os.path.abspath(p))
+            for p in path_entries
+            if p
+        }
+        extra: list[str] = []
+        for p in self._extra_paths:
+            if not os.path.isdir(p):
+                continue
+            key = os.path.normcase(os.path.abspath(p))
+            if key in normalized:
+                continue
+            extra.append(p)
+            normalized.add(key)
         if extra:
             env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
         return env
@@ -270,7 +281,7 @@ class TestAnalyzer:
         else:
             return (
                 "python -m compileall . -q",
-                "python -m pytest tests/ -v || true",
+                "python -m pytest tests/ -v",
             )
 
     @staticmethod
@@ -332,19 +343,22 @@ class TestAnalyzer:
             test_cmd = test_cmd or detected_test
 
         # 运行编译
-        analysis.compilation = self._run_compilation(compile_cmd)
-        if not analysis.compilation.success:
+        compilation_result = self._run_compilation(compile_cmd)
+        analysis.compilation = compilation_result
+        if not compilation_result.success:
             logger.warning("  ⚠️ Compilation failed, skipping tests")
             return analysis
 
-        # 运行测试
+        # 运行测试，并保留编译阶段的 stdout/stderr 诊断信息
         analysis = self._run_tests(test_cmd)
+        analysis.compilation = compilation_result
         return analysis
 
     # ── 编译 ───────────────────────────────────────────────────
 
     def _run_compilation(self, command: str) -> CompilationResult:
         try:
+            env = self._build_env_with_toolchain()
             result = subprocess_run(
                 command,
                 shell=True,
@@ -353,6 +367,7 @@ class TestAnalyzer:
                 errors="replace",
                 cwd=self.working_dir,
                 timeout=self.timeout,
+                env=env,
             )
             status = "✅" if result.returncode == 0 else "❌"
             logger.info(f"  {status} Compilation: {'SUCCESS' if result.returncode == 0 else 'FAILED'}")
@@ -433,68 +448,69 @@ class TestAnalyzer:
 
     # ── 输出解析 ───────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_pytest_summary(output: str) -> tuple[int, int] | None:
+        """解析 pytest summary，返回 (passed, failed_or_errors)。"""
+        import re
+
+        passed = 0
+        failed = 0
+        found = False
+        summary_lines = re.findall(r"=+\s*([^=\n]*(?:passed|failed|error|errors)[^=\n]*)\s*=+", output, re.IGNORECASE)
+        if not summary_lines:
+            summary_lines = [line for line in output.splitlines() if re.search(r"\b(passed|failed|error|errors)\b", line, re.IGNORECASE)]
+
+        for line in summary_lines:
+            for count, word in re.findall(r"(\d+)\s+(passed|failed|error|errors)\b", line, re.IGNORECASE):
+                found = True
+                n = int(count)
+                word = word.lower()
+                if word == "passed":
+                    passed += n
+                else:
+                    failed += n
+        return (passed, failed) if found else None
+
+    @staticmethod
+    def _parse_gtest_summary(output: str) -> tuple[int, int] | None:
+        """解析 Google Test 输出，支持多个二进制结果累加。"""
+        import re
+
+        passed = sum(
+            int(n) for n in re.findall(
+                r"\[\s+PASSED\s+\]\s+(\d+)\s+test", output, re.IGNORECASE
+            )
+        )
+        failed = sum(
+            int(n) for n in re.findall(
+                r"\[\s+FAILED\s+\]\s+(\d+)\s+test", output, re.IGNORECASE
+            )
+        )
+        return (passed, failed) if passed > 0 or failed > 0 else None
+
     def _parse_test_output(self, output: str, exit_code: int) -> TestAnalysis:
         """
         解析测试输出，提取通过数/总数/模块信息。
 
-        可控性：可覆盖此方法适配不同测试框架的输出格式。
-        当前支持：
-        - pytest:  "32 passed, 0 failed"
-        - Google Test: "[  PASSED  ] 32 tests."
-
-        解析策略（逐级降级）：
-          1. pytest 完整格式（=== N passed, M failed ===）
-          2. Google Test 格式
-          3. 通用 N passed / N failed 关键词
-          4. 无匹配时根据退出码推断隐式失败
+        当前支持 pytest、Google Test，并在无法解析但退出码非零时降级为
+        1 个隐式失败，避免把基础设施/导入错误误判为无测试。
         """
-        import re
-
         analysis = TestAnalysis()
         analysis.compilation = CompilationResult(success=True)
         passed = 0
         failed = 0
 
-        # --- 1) pytest 格式 ---
-        m = re.search(
-            r"=+\s+(\d+)\s+passed.*?(\d+)\s+failed", output, re.DOTALL
-        )
-        if m:
-            passed = int(m.group(1))
-            failed = int(m.group(2))
-            logger.debug(f"Parsed pytest output: {passed} passed, {failed} failed")
+        parsed = self._parse_pytest_summary(output)
+        if parsed:
+            passed, failed = parsed
+            logger.debug(f"Parsed pytest output: {passed} passed, {failed} failed/errors")
 
-        # --- 2) Google Test 格式（累计多个 test_*.exe 的结果）---
         if passed == 0 and failed == 0:
-            passed = sum(
-                int(n) for n in re.findall(
-                    r"\[\s+PASSED\s+\]\s+(\d+)\s+test", output, re.IGNORECASE
-                )
-            )
-            failed = sum(
-                int(n) for n in re.findall(
-                    r"\[\s+FAILED\s+\]\s+(\d+)\s+test", output, re.IGNORECASE
-                )
-            )
-            if passed > 0 or failed > 0:
-                logger.debug(
-                    f"Parsed Google Test output: {passed} passed, {failed} failed"
-                )
+            parsed = self._parse_gtest_summary(output)
+            if parsed:
+                passed, failed = parsed
+                logger.debug(f"Parsed Google Test output: {passed} passed, {failed} failed")
 
-        # --- 3) 通用关键词降级 ---
-        if passed == 0 and failed == 0:
-            p = re.search(r"(\d+)\s+passed", output, re.IGNORECASE)
-            f = re.search(r"(\d+)\s+failed", output, re.IGNORECASE)
-            if p:
-                passed = int(p.group(1))
-            if f:
-                failed = int(f.group(1))
-            if p or f:
-                logger.debug(
-                    f"Parsed generic output: {passed} passed, {failed} failed"
-                )
-
-        # --- 4) 未解析到任何结果 + 非零退出 → 基础设施失败 ---
         if passed == 0 and failed == 0 and exit_code != 0:
             logger.warning(
                 f"No tests parsed but exit code = {exit_code} (non-zero), "
