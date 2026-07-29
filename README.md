@@ -12,6 +12,7 @@
 - **依赖分层翻译**：可接入 Code2Graph/file_topo_sort，按文件依赖分层推进。
 - **双目录物理隔离**：完整源码放在 `.source_staging`，LLM 只看到当前层解锁后的 `.source`。
 - **测试反馈闭环**：每轮 `finish` 后自动运行测试分析，把编译/测试失败反馈给 LLM。
+- **翻译完整性守卫**：每次 `finish` 后、测试前检查当前累计层目标文件是否完整，缺失时结构化提醒补齐并限制重试，避免跳文件和空转。
 - **反思纠错工具**：失败后可提示并调用 `reflect` 分析根因。
 - **功能调用追踪日志**：单独生成 JSONL trace，记录 LLM 请求/响应、工具调用、Observation、外层轮次事件，便于排查空转。
 - **多语言配置基础设施**：已具备语言扩展名、脚手架、测试分析等扩展点。
@@ -161,6 +162,7 @@ logs/<model>/<project>_<source>_to_<target>_<timestamp>/
 | `ROUND_TIMEOUT` | `--round_timeout` | `1800` | 单轮 `Conversation.run()` 超时秒数 |
 | `INVALID_RESPONSE_LIMIT` | `--invalid_response_limit` | `3` | 连续无效 LLM 响应上限 |
 | `RUNTIME_ERROR_LIMIT` | `--runtime_error_limit` | `3` | 连续可恢复运行时错误上限 |
+| `COMPLETENESS_RETRY_LIMIT` | `--completeness_retry_limit` | `3` | 翻译完整性检查失败后的连续补齐重试上限 |
 | `REFLECTION_ENABLED` | `--no-reflection` | `1` | 是否启用失败后的 reflect 指引和工具 |
 
 ### 工具与测试配置

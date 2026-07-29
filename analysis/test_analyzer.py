@@ -512,11 +512,19 @@ class TestAnalyzer:
                 logger.debug(f"Parsed Google Test output: {passed} passed, {failed} failed")
 
         if passed == 0 and failed == 0 and exit_code != 0:
-            logger.warning(
-                f"No tests parsed but exit code = {exit_code} (non-zero), "
-                f"treating as 1 implicit failure"
-            )
-            failed = 1
+            # pytest exit code 5 = "no tests collected" — 不是真正失败，
+            # 不应阻止翻译流程。保留 total=0，由 run.py 的 no_tests 逻辑处理。
+            if exit_code == 5:
+                logger.info(
+                    f"No tests collected (pytest exit code 5); "
+                    f"allowing layer to proceed if completeness OK"
+                )
+            else:
+                logger.warning(
+                    f"No tests parsed but exit code = {exit_code} (non-zero), "
+                    f"treating as 1 implicit failure"
+                )
+                failed = 1
 
         analysis.total_tests = passed + failed
         analysis.passed_tests = passed

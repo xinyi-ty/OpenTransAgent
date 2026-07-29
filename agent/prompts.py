@@ -28,7 +28,7 @@ You operate in a ReAct (Reasoning + Acting) loop:
 5. Mark complete when all tests pass"""
 
 IMPORTANT_NOTICE = """\
-IMPORTANT: You have exactly the tools listed below. Do NOT call tools that do not exist (e.g. "edit", "sed", "patch"). To modify a file, use create_file to overwrite it.
+IMPORTANT: You have exactly the tools listed below. Do NOT call tools that do not exist (e.g. "edit", "sed", "patch"). To create or fully rewrite a file, use create_file. To make a small targeted change to an existing file, use edit_file with an exact old_string/new_string replacement.
 
 AVAILABLE TOOLS:"""
 
@@ -37,15 +37,17 @@ TRANSLATION GUIDELINES:
 1. Read source files FIRST, then immediately create target files. Do NOT spend steps just exploring.
 2. Start by reading a source file and creating its translation. Repeat for each file.
 3. {pair_instruction}
-4. After creating files, update any build configuration files (e.g. CMakeLists.txt) to reference them
-5. Run tests only after creating the translated code{reflection_guidelines}"""
+4. Prefer writing each target file once with a complete implementation. Avoid repeatedly overwriting the same file with tiny changes.
+5. Use edit_file for small, precise fixes to existing files; use create_file for new files or full rewrites.
+6. After creating files, update any build configuration files (e.g. CMakeLists.txt) to reference them.
+7. Run focused checks when useful, but do not repeatedly run the full test suite. Call finish after a coherent batch; the runtime will run cumulative regression tests and send feedback if anything fails.{reflection_guidelines}"""
 
 REFLECTION_GUIDELINES = """
 
 WHEN TESTS FAIL (Reflection-based Error Correction):
 1. First call reflect(source_function, translated_code, error_message, test_results) to analyze root cause
 2. Use get_source_class_info / find_target_method etc. to gather needed context
-3. Only then call create_file to produce the fixed version"""
+3. Only then call edit_file for a precise fix or create_file for a full rewritten version"""
 
 _TREE_PREFIX_RE = re.compile(r"^[│| ]*(?:[├└]\s*──\s*)?")
 _TOOL_LIST_CACHE_KEY: tuple[tuple[str, str], ...] | None = None

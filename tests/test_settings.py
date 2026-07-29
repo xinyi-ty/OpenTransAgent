@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from config.settings import (
+    get_completeness_retry_limit,
     get_invalid_response_limit,
     get_llm_config,
     get_reflection_enabled,
@@ -28,6 +29,7 @@ def test_translation_runtime_defaults(monkeypatch) -> None:
         "REFLECTION_ENABLED",
         "INVALID_RESPONSE_LIMIT",
         "RUNTIME_ERROR_LIMIT",
+        "COMPLETENESS_RETRY_LIMIT",
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -40,6 +42,7 @@ def test_translation_runtime_defaults(monkeypatch) -> None:
     assert get_reflection_enabled() is True
     assert get_invalid_response_limit() == 3
     assert get_runtime_error_limit() == 3
+    assert get_completeness_retry_limit() == 3
 
 
 def test_cli_values_override_env(monkeypatch) -> None:

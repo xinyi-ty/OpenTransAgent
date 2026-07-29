@@ -4,9 +4,15 @@ import time
 from pathlib import Path
 
 import pytest
+from openhands.sdk import Conversation, LLM
 
+from agent.translation_agent import ReActTranslationAgent
 from run import (
     _build_layer_test_command,
+    _check_translation_completeness,
+    _collect_visible_test_files,
+    _expected_target_for_source,
+    _format_completeness_feedback,
     _run_conversation_with_timeout,
     _safe_close_conversation,
 )
@@ -30,6 +36,118 @@ class _Conversation:
 
     def close(self) -> None:
         self.closed = True
+
+
+def test_trace_tool_call_info_supports_dict_and_direct_name() -> None:
+    class ToolCall:
+        id = "call-1"
+        name = "edit_file"
+        arguments = "{}"
+
+    assert ReActTranslationAgent._trace_tool_call_info(ToolCall()) == {
+        "id": "call-1",
+        "name": "edit_file",
+        "arguments": "{}",
+    }
+    assert ReActTranslationAgent._trace_tool_call_info({
+        "id": "call-2",
+        "function": {"name": "create_file", "arguments": "{x}"},
+    }) == {
+        "id": "call-2",
+        "name": "create_file",
+        "arguments": "{x}",
+    }
+
+
+def test_trace_logger_is_passed_during_agent_creation(tmp_path: Path) -> None:
+    trace_logger = object()
+    agent = ReActTranslationAgent.create(
+        llm=LLM(model="dummy/model", api_key="dummy-key", timeout=1),
+        workspace_root=str(tmp_path),
+        project_name="demo",
+        source_language="cpp",
+        target_language="python",
+        trace_logger=trace_logger,
+    )
+
+    assert agent.trace_logger is trace_logger
+
+
+def test_trace_logger_is_excluded_from_conversation_serialization(tmp_path: Path) -> None:
+    trace_logger = object()
+    agent = ReActTranslationAgent.create(
+        llm=LLM(model="dummy/model", api_key="dummy-key", timeout=1),
+        workspace_root=str(tmp_path),
+        project_name="demo",
+        source_language="cpp",
+        target_language="python",
+        trace_logger=trace_logger,
+    )
+
+    dumped = agent.model_dump(mode="json")
+    assert "trace_logger" not in dumped
+
+    conv = Conversation(
+        agent=agent,
+        workspace=str(tmp_path / "workspace"),
+        persistence_dir=None,
+        visualizer=None,
+    )
+    conv.close()
+
+
+def test_expected_target_for_source_uses_route_mapping() -> None:
+    assert _expected_target_for_source("src/foo.cpp", "cpp", "python") == "src/foo.py"
+    assert _expected_target_for_source("pkg/foo.py", "python", "cpp") == "pkg/foo.cpp"
+
+
+def test_check_translation_completeness_uses_paths_not_only_stems(tmp_path: Path) -> None:
+    layers = [["src/a/util.cpp", "src/b/util.cpp"]]
+    (tmp_path / "src" / "a").mkdir(parents=True)
+    (tmp_path / "src" / "a" / "util.py").write_text("", encoding="utf-8")
+
+    result = _check_translation_completeness(
+        str(tmp_path),
+        layers,
+        None,
+        0,
+        "cpp",
+        "python",
+    )
+
+    assert result.passed is False
+    assert result.expected_count == 2
+    assert result.present_count == 1
+    assert [m.expected for m in result.missing] == ["src/b/util.py"]
+
+
+def test_format_completeness_feedback_is_structured() -> None:
+    result = _check_translation_completeness(
+        ".",
+        [["missing.cpp"]],
+        None,
+        0,
+        "cpp",
+        "python",
+    )
+
+    feedback = _format_completeness_feedback(result, attempt=2, retry_limit=3)
+
+    assert "COMPLETENESS RECOVERY MODE" in feedback
+    assert "Source: missing.cpp -> Expected target: missing.py" in feedback
+    assert "Do NOT run tests while files are missing" in feedback
+
+
+def test_collect_visible_test_files_is_cumulative_and_deduped() -> None:
+    test_layers = [["tests/a.py", "tests/common.py"], ["tests/b.py", "tests/common.py"]]
+
+    assert _collect_visible_test_files(test_layers, 0) == ["tests/a.py", "tests/common.py"]
+    assert _collect_visible_test_files(test_layers, 1) == [
+        "tests/a.py",
+        "tests/common.py",
+        "tests/b.py",
+    ]
+    assert _collect_visible_test_files(None, 1) == []
 
 
 def test_build_layer_test_command_quotes_python_paths(tmp_path: Path) -> None:

@@ -141,6 +141,38 @@ def test_trace_logger_thread_safe_writes(tmp_path: Path) -> None:
     assert len(lines) == 400
 
 
+def test_trace_logger_writes_live_markdown_during_run(tmp_path: Path) -> None:
+    t = TranslationTraceLogger(
+        tmp_path,
+        run_id="live",
+        project_name="demo",
+        model="model-x",
+        source_language="cpp",
+        target_language="python",
+    )
+    t.set_context(layer_idx=1, round_idx=2)
+    t.write("action_event", tool_name="read_file", action_data={"filepath": "a.cpp"})
+    t.write("completeness_check", payload={
+        "passed": False,
+        "expected_count": 2,
+        "present_count": 1,
+        "missing_count": 1,
+        "missing": [{"source": "b.cpp", "expected": "b.py"}],
+    })
+
+    assert t.live_path.exists()
+    live = t.live_path.read_text(encoding="utf-8")
+    assert "# 实时翻译进度" in live
+    assert "当前 Layer：1" in live
+    assert "当前 Round：2" in live
+    assert "最近完整性检查" in live
+    assert "`b.cpp` → `b.py`" in live
+    assert "`action_event`" in live
+    assert "调用工具：`read_file`" in live
+    assert "完整性检查失败：1/2 已生成，缺失 1" in live
+    t.close()
+
+
 def test_trace_logger_context_sets_layer_and_round(tmp_path: Path) -> None:
     t = TranslationTraceLogger(tmp_path, run_id="ctx")
     t.set_context(layer_idx=2, round_idx=5)
@@ -165,11 +197,50 @@ def test_trace_logger_generates_chinese_summary_and_index(tmp_path: Path) -> Non
         source_language="python",
         target_language="cpp",
     )
+    t.write("run_start")
     t.set_context(layer_idx=0, round_idx=1, step=1)
+    t.write("layer_start", payload={"file_count": 2})
+    t.write("round_start")
     t.write("llm_request", payload={"message_count": 2, "tools": [{"name": "read_file"}]})
     t.write("llm_response", payload={"response_type": "tool_calls", "tool_calls": [{"name": "read_file"}]})
+    t.write("action_event", tool_name="create_file", action_data={"filepath": "main.cpp"})
+    t.write("action_event", tool_name="create_file", action_data={"filepath": "main.cpp"})
+    t.write("action_event", tool_name="read_file", action_data={"filepath": "source.py"})
     t.write("idle_nudge", payload={"reason": "no_files_created", "new_file_count": 0})
-    t.write("test_analysis_result", payload={"passed_tests": 0, "total_tests": 1, "compilation_success": False})
+    t.write("completeness_check", payload={
+        "layer": 0,
+        "attempt": 1,
+        "retry_limit": 3,
+        "passed": False,
+        "expected_count": 2,
+        "present_count": 1,
+        "missing_count": 1,
+        "missing": [{"source": "missing.py", "expected": "missing.cpp", "layer": 0}],
+    })
+    t.write("completeness_feedback_sent", payload={"layer": 0, "attempt": 1, "missing_count": 1})
+    t.write("completeness_check", payload={
+        "layer": 0,
+        "attempt": 2,
+        "retry_limit": 3,
+        "passed": True,
+        "expected_count": 2,
+        "present_count": 2,
+        "missing_count": 0,
+        "missing": [],
+    })
+    t.write("test_analysis_start", payload={
+        "test_scope": "cumulative_regression",
+        "new_test_files": [],
+        "visible_test_files": ["tests/test_main.py"],
+        "test_command": "python -m pytest tests/test_main.py -v",
+    })
+    t.write("test_analysis_result", payload={
+        "passed_tests": 1,
+        "total_tests": 1,
+        "compilation_success": True,
+    })
+    t.write("round_end", payload={"elapsed_s": 65})
+    t.write("run_end", payload={"elapsed_s": 70, "all_passed": True})
     t.close()
 
     assert t.summary_path.exists()
@@ -177,8 +248,15 @@ def test_trace_logger_generates_chinese_summary_and_index(tmp_path: Path) -> Non
     summary = t.summary_path.read_text(encoding="utf-8")
     index = json.loads(t.index_path.read_text(encoding="utf-8"))
 
-    assert "# 翻译过程追踪摘要" in summary
-    assert "可能需要关注的问题" in summary
-    assert "空转提醒" in summary
+    assert "# 翻译运行分析报告" in summary
+    assert "## 2. 分层执行结果" in summary
+    assert "## 6. 翻译完整性检查" in summary
+    assert "完整性补齐反馈" in summary
+    assert "累计回归测试" in summary
+    assert "本层没有新增测试文件" in summary
+    assert "`create_file`" in summary
+    assert "`main.cpp`（2 次）" in summary
+    assert "重复写入文件" in summary
+    assert "本次翻译成功完成" in summary
     assert index["event_counts"]["idle_nudge"] == 1
     assert index["summary_file"] == "translation_trace_summary.md"

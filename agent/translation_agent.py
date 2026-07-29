@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pydantic import Field
+
 from openhands.sdk import LLM, Agent
 from openhands.sdk.agent.response_dispatch import classify_response, LLMResponseType
 from openhands.sdk.agent.utils import make_llm_completion, prepare_llm_messages
@@ -43,7 +45,7 @@ class ReActTranslationAgent(Agent):
     project_tree: str = ""
     translation_order: list[str] | None = None
     source_files: list[str] | None = None
-    trace_logger: Any | None = None
+    trace_logger: Any | None = Field(default=None, exclude=True)
 
     # ── 内部状态 ────────────────────────────────────────────────
     _step_count: int = 0
@@ -250,10 +252,7 @@ class ReActTranslationAgent(Agent):
                 entry["content_len"] = len(content_text)
                 entry["content_preview"] = content_text[:1000]
             if tool_calls:
-                entry["tool_calls"] = [
-                    {"id": getattr(tc, "id", None), "name": getattr(getattr(tc, "function", None), "name", None)}
-                    for tc in tool_calls
-                ]
+                entry["tool_calls"] = [self._trace_tool_call_info(tc) for tc in tool_calls]
             if tool_call_id:
                 entry["tool_call_id"] = tool_call_id
             msg_summaries.append(entry)
@@ -274,13 +273,7 @@ class ReActTranslationAgent(Agent):
         content_text = self._extract_text_content(msg)
         tool_calls_info: list[dict[str, Any]] = []
         if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                func = getattr(tc, "function", None)
-                tool_calls_info.append({
-                    "id": getattr(tc, "id", None),
-                    "name": getattr(func, "name", None) if func else None,
-                    "arguments": getattr(func, "arguments", None) if func else None,
-                })
+            tool_calls_info = [self._trace_tool_call_info(tc) for tc in msg.tool_calls]
         usage = {}
         if hasattr(llm_response, "usage") and llm_response.usage:
             u = llm_response.usage
@@ -297,6 +290,32 @@ class ReActTranslationAgent(Agent):
             "tool_calls": tool_calls_info,
             "usage": usage,
         })
+
+    @staticmethod
+    def _trace_tool_call_info(tool_call) -> dict[str, Any]:
+        """兼容不同 SDK/provider tool call 结构，提取 trace 所需字段。"""
+        if isinstance(tool_call, dict):
+            func = tool_call.get("function") or {}
+            return {
+                "id": tool_call.get("id"),
+                "name": tool_call.get("name") or tool_call.get("tool_name") or func.get("name"),
+                "arguments": tool_call.get("arguments") or func.get("arguments"),
+            }
+        func = getattr(tool_call, "function", None)
+        name = (
+            getattr(tool_call, "name", None)
+            or getattr(tool_call, "tool_name", None)
+            or (getattr(func, "name", None) if func else None)
+        )
+        arguments = (
+            getattr(tool_call, "arguments", None)
+            or (getattr(func, "arguments", None) if func else None)
+        )
+        return {
+            "id": getattr(tool_call, "id", None),
+            "name": name,
+            "arguments": arguments,
+        }
 
     # -- 响应分发 -----------------------------------------------
 

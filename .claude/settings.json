@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(apply_patch)"
+      "Bash(apply_patch)",
+      "Bash(python -m pytest tests/test_run.py -q)"
     ]
   }
 }

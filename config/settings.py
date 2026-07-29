@@ -21,6 +21,7 @@ DEFAULT_TEST_RAW_OUTPUT_LIMIT = 5000
 DEFAULT_REFLECTION_ENABLED = True
 DEFAULT_INVALID_RESPONSE_LIMIT = 3
 DEFAULT_RUNTIME_ERROR_LIMIT = 3
+DEFAULT_COMPLETENESS_RETRY_LIMIT = 3
 DEFAULT_TRACE_LOG_ENABLED = True
 DEFAULT_TRACE_LOG_MAX_FIELD_CHARS = 20000
 DEFAULT_TRACE_LOG_REDACT_SECRETS = True
@@ -186,6 +187,17 @@ def get_runtime_error_limit(args: Any = None) -> int:
         "runtime_error_limit",
         "RUNTIME_ERROR_LIMIT",
         DEFAULT_RUNTIME_ERROR_LIMIT,
+        min_value=1,
+    )
+
+
+def get_completeness_retry_limit(args: Any = None) -> int:
+    """获取翻译完整性检查失败后的连续补齐重试上限。"""
+    return _get_arg_or_env_int(
+        args,
+        "completeness_retry_limit",
+        "COMPLETENESS_RETRY_LIMIT",
+        DEFAULT_COMPLETENESS_RETRY_LIMIT,
         min_value=1,
     )
 

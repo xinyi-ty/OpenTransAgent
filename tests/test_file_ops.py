@@ -5,6 +5,8 @@ from pathlib import Path
 from tools.file_ops import (
     CreateFileAction,
     CreateFileExecutor,
+    EditFileAction,
+    EditFileExecutor,
     ListFilesAction,
     ListFilesExecutor,
     ReadFileAction,
@@ -113,3 +115,78 @@ def test_list_files_truncates_large_directory(tmp_path: Path) -> None:
     assert obs.is_error is False
     assert obs.count == _LIST_MAX_ENTRIES
     assert "truncated" in obs.text
+
+
+def test_edit_file_replaces_unique_string(tmp_path: Path) -> None:
+    path = tmp_path / "src" / "out.py"
+    path.parent.mkdir()
+    path.write_text("one\ntwo\n", encoding="utf-8")
+
+    obs = EditFileExecutor(str(tmp_path))(
+        EditFileAction(filepath="src/out.py", old_string="two", new_string="three")
+    )
+
+    assert obs.is_error is False
+    assert obs.replacements == 1
+    assert path.read_text(encoding="utf-8") == "one\nthree\n"
+
+
+def test_edit_file_rejects_workspace_escape(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}_outside.txt"
+    outside.write_text("one", encoding="utf-8")
+    try:
+        obs = EditFileExecutor(str(tmp_path))(
+            EditFileAction(
+                filepath=f"../{outside.name}",
+                old_string="one",
+                new_string="two",
+            )
+        )
+
+        assert obs.is_error is True
+        assert outside.read_text(encoding="utf-8") == "one"
+    finally:
+        outside.unlink(missing_ok=True)
+
+
+def test_edit_file_rejects_non_unique_old_string_without_replace_all(tmp_path: Path) -> None:
+    path = tmp_path / "dup.txt"
+    path.write_text("x\nx\n", encoding="utf-8")
+
+    obs = EditFileExecutor(str(tmp_path))(
+        EditFileAction(filepath="dup.txt", old_string="x", new_string="y")
+    )
+
+    assert obs.is_error is True
+    assert "出现 2 次" in obs.text
+    assert path.read_text(encoding="utf-8") == "x\nx\n"
+
+
+def test_edit_file_replace_all(tmp_path: Path) -> None:
+    path = tmp_path / "dup.txt"
+    path.write_text("x\nx\n", encoding="utf-8")
+
+    obs = EditFileExecutor(str(tmp_path))(
+        EditFileAction(filepath="dup.txt", old_string="x", new_string="y", replace_all=True)
+    )
+
+    assert obs.is_error is False
+    assert obs.replacements == 2
+    assert path.read_text(encoding="utf-8") == "y\ny\n"
+
+
+def test_edit_file_layer_lock_uses_relative_path(tmp_path: Path) -> None:
+    path = tmp_path / "future.py"
+    path.write_text("one", encoding="utf-8")
+    ctrl = DummyLayerCtrl(unlocked=False)
+    set_layer_ctrl(ctrl)
+    try:
+        obs = EditFileExecutor(str(tmp_path))(
+            EditFileAction(filepath="future.py", old_string="one", new_string="two")
+        )
+    finally:
+        set_layer_ctrl(None)
+
+    assert obs.is_error is True
+    assert ctrl.seen == ["future.py"]
+    assert path.read_text(encoding="utf-8") == "one"

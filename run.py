@@ -5,6 +5,7 @@ import concurrent.futures
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from utils.logger import logger, suppress_sdk_logging, setup_log_dir, save_promp
 suppress_sdk_logging()
 
 from config.settings import (
+    get_completeness_retry_limit,
     get_invalid_response_limit,
     get_llm_config,
     get_max_iterations,
@@ -43,7 +45,7 @@ from workspace.manager import (prepare_source_workspace, get_project_tree,
 from workspace.precheck import run_precheck
 from analysis.test_analyzer import TestAnalysis, TestAnalyzer
 from config.languages import get_target_extensions
-from config.router import validate_pair
+from config.router import get_route, validate_pair
 
 def parse_args():
     p = argparse.ArgumentParser(description="OpenTransAgent - 仓库级代码翻译")
@@ -79,6 +81,8 @@ def parse_args():
                    help="连续无效响应上限（默认 3）")
     p.add_argument("--runtime_error_limit", type=int, default=None,
                    help="连续可恢复运行时错误上限（默认 3）")
+    p.add_argument("--completeness_retry_limit", type=int, default=None,
+                   help="翻译完整性检查失败后的连续补齐重试上限（默认 3）")
     p.add_argument("--no_trace_log", action="store_true",
                    help="禁用功能调用追踪日志")
     p.add_argument("--trace_log_max_field_chars", type=int, default=None,
@@ -141,8 +145,21 @@ def _quote_cmd_arg(value: str) -> str:
     return subprocess.list2cmdline([value])
 
 
+def _collect_visible_test_files(
+    test_layers: list[list[str]] | None,
+    layer_idx: int,
+) -> list[str]:
+    """收集当前 workspace 已解锁/已复制的累计测试文件。"""
+    if not test_layers:
+        return []
+    visible: list[str] = []
+    for layer_tests in test_layers[:layer_idx + 1]:
+        visible.extend(layer_tests)
+    return list(dict.fromkeys(visible))
+
+
 def _build_layer_test_command(test_files: list[str], working_dir: str) -> str | None:
-    """按当前层测试文件构造测试命令，尽量避免未引用路径和无效 exe 路径。"""
+    """按累计可见测试文件构造测试命令，尽量避免未引用路径和无效 exe 路径。"""
     root = Path(working_dir)
     all_subcmds: list[str] = []
     for tf in test_files:
@@ -165,6 +182,136 @@ def _build_layer_test_command(test_files: list[str], working_dir: str) -> str | 
             ))
 
     return " & ".join(all_subcmds) if all_subcmds else None
+
+
+@dataclass(frozen=True)
+class MissingTranslation:
+    source: str
+    expected: str
+    layer: int
+
+
+@dataclass(frozen=True)
+class CompletenessResult:
+    expected_count: int
+    present_count: int
+    missing: list[MissingTranslation]
+
+    @property
+    def passed(self) -> bool:
+        return not self.missing
+
+
+def _expected_target_for_source(
+    source_file: str,
+    source_language: str,
+    target_language: str,
+) -> str:
+    """用语言路由生成期望目标路径；无路由时退回源路径。"""
+    route = get_route(source_language, target_language)
+    if route and route.file_extension_map:
+        return route.file_extension_map(source_file)
+    return source_file
+
+
+def _expected_translations_for_layers(
+    layers: list[list[str]] | None,
+    translation_order: list[str] | None,
+    layer_idx: int,
+    source_language: str,
+    target_language: str,
+) -> list[MissingTranslation]:
+    """生成当前累计层应存在的目标文件清单（用 MissingTranslation 复用字段结构）。"""
+    expected: list[MissingTranslation] = []
+    seen: set[str] = set()
+    if layers:
+        source_with_layers = [
+            (src, idx)
+            for idx, layer in enumerate(layers[:layer_idx + 1])
+            for src in layer
+        ]
+    else:
+        source_with_layers = [(src, 0) for src in (translation_order or [])]
+    for src, src_layer in source_with_layers:
+        target = _expected_target_for_source(src, source_language, target_language)
+        if target in seen:
+            continue
+        seen.add(target)
+        expected.append(MissingTranslation(source=src, expected=target, layer=src_layer))
+    return expected
+
+
+def _check_translation_completeness(
+    workspace_path: str,
+    layers: list[list[str]] | None,
+    translation_order: list[str] | None,
+    layer_idx: int,
+    source_language: str,
+    target_language: str,
+) -> CompletenessResult:
+    """检查当前累计层的期望目标文件是否全部存在。"""
+    expected = _expected_translations_for_layers(
+        layers, translation_order, layer_idx, source_language, target_language,
+    )
+    ws = Path(workspace_path)
+    missing = [item for item in expected if not (ws / item.expected).is_file()]
+    return CompletenessResult(
+        expected_count=len(expected),
+        present_count=len(expected) - len(missing),
+        missing=missing,
+    )
+
+
+def _format_completeness_feedback(
+    result: CompletenessResult,
+    attempt: int,
+    retry_limit: int,
+) -> str:
+    """把缺失文件清单格式化为强约束补齐消息，避免模型空转。"""
+    lines = [
+        "[SYSTEM: TRANSLATION COMPLETENESS CHECK FAILED]",
+        f"Attempt {attempt}/{retry_limit}.",
+        f"Expected translated files: {result.expected_count}; present: {result.present_count}; missing: {len(result.missing)}.",
+        "",
+        "Missing translations:",
+    ]
+    for i, item in enumerate(result.missing[:20], 1):
+        lines.append(f"{i}. Source: {item.source} -> Expected target: {item.expected} (Layer {item.layer})")
+    if len(result.missing) > 20:
+        lines.append(f"... and {len(result.missing) - 20} more")
+    lines.extend([
+        "",
+        "Rules:",
+        "- Work only on the missing target files listed above.",
+        "- For each item, read the corresponding source file, then create_file the expected target path.",
+        "- If a target file exists but is incomplete, use edit_file for precise fixes.",
+        "- Do NOT run tests while files are missing.",
+        "- Do NOT explain that files are unnecessary unless you create a small stub target file that preserves compatibility.",
+        "- Do NOT call finish until all expected target files exist.",
+    ])
+    if attempt >= max(2, retry_limit - 1):
+        lines.insert(1, "SYSTEM: COMPLETENESS RECOVERY MODE — previous attempts did not finish all required files.")
+    return "\n".join(lines)
+
+
+def _completeness_payload(
+    result: CompletenessResult,
+    *,
+    layer_idx: int,
+    attempt: int,
+    retry_limit: int,
+    passed: bool | None = None,
+) -> dict[str, Any]:
+    return {
+        "layer": layer_idx,
+        "attempt": attempt,
+        "retry_limit": retry_limit,
+        "passed": result.passed if passed is None else passed,
+        "expected_count": result.expected_count,
+        "present_count": result.present_count,
+        "missing_count": len(result.missing),
+        "missing": [item.__dict__ for item in result.missing[:50]],
+    }
 
 
 def _is_retryable_runtime_error(exc: BaseException) -> bool:
@@ -266,6 +413,7 @@ def main():
     reflection_enabled = get_reflection_enabled(args)
     invalid_response_limit = get_invalid_response_limit(args)
     runtime_error_limit = get_runtime_error_limit(args)
+    completeness_retry_limit = get_completeness_retry_limit(args)
     persistence = args.persistence_dir or None
     trace_log_enabled = get_trace_log_enabled(args)
     trace_log_max_field_chars = get_trace_log_max_field_chars(args)
@@ -290,6 +438,7 @@ def main():
                 f"  |  Round timeout: {round_timeout}s"
                 f"  |  Test timeout: {test_timeout}s"
                 f"  |  Raw output limit: {test_raw_output_limit}"
+                f"  |  Completeness retries: {completeness_retry_limit}"
                 f"  |  Reflection: {'on' if reflection_enabled else 'off'}")
     logger.info("-" * 50)
 
@@ -346,27 +495,9 @@ def main():
     # 刷新文件树（Layer 0 文件加入后）
     tree = get_project_tree(source_ws)
 
-    # ── Agent 初始化 ──────────────────────────────────────────
-    initial_source_files = layers[0] if layers else translation_order
-    agent = ReActTranslationAgent.create(
-        llm=llm, workspace_root=source_ws,
-        max_iterations=max_iter * steps_per_round,
-        project_name=project_name, source_language=args.source_language,
-        target_language=args.target_language, project_tree=tree,
-        translation_order=translation_order, layer_ctrl=layer_ctrl,
-        command_timeout=tool_command_timeout,
-        search_max_results=search_max_results,
-        reflection_enabled=reflection_enabled,
-        invalid_response_limit=invalid_response_limit,
-        source_files=initial_source_files)
-
-    # ── 保存 System Prompt 到日志文件 ─────────────────────────
+    # ── 日志目录与功能调用追踪日志 ─────────────────────────────
     log_dir = setup_log_dir(model, project_name,
                             args.source_language, args.target_language)
-    prompt_path = save_prompt_to(log_dir, agent.system_prompt)
-    logger.info(f"💾 System prompt saved to: {prompt_path}")
-
-    # ── 功能调用追踪日志 ─────────────────────────────────────
     trace_logger = None
     if trace_log_enabled:
         trace_logger = TranslationTraceLogger(
@@ -379,8 +510,26 @@ def main():
             max_field_chars=trace_log_max_field_chars,
             redact_secrets=trace_log_redact,
         )
-        agent.trace_logger = trace_logger
         logger.info(f"📝 Translation trace: {trace_logger.path}")
+
+    # ── Agent 初始化 ──────────────────────────────────────────
+    initial_source_files = layers[0] if layers else translation_order
+    agent = ReActTranslationAgent.create(
+        llm=llm, workspace_root=source_ws,
+        max_iterations=max_iter * steps_per_round,
+        project_name=project_name, source_language=args.source_language,
+        target_language=args.target_language, project_tree=tree,
+        translation_order=translation_order, layer_ctrl=layer_ctrl,
+        command_timeout=tool_command_timeout,
+        search_max_results=search_max_results,
+        reflection_enabled=reflection_enabled,
+        invalid_response_limit=invalid_response_limit,
+        source_files=initial_source_files,
+        trace_logger=trace_logger)
+
+    # ── 保存 System Prompt 到日志文件 ─────────────────────────
+    prompt_path = save_prompt_to(log_dir, agent.system_prompt)
+    logger.info(f"💾 System prompt saved to: {prompt_path}")
 
     # visualizer=None: 屏蔽 SDK 的 Rich 可视化输出
     conv_args: dict[str, Any] = {
@@ -409,6 +558,7 @@ def main():
             "max_iter": max_iter,
             "steps_per_round": steps_per_round,
             "reflection_enabled": reflection_enabled,
+            "completeness_retry_limit": completeness_retry_limit,
         })
 
     final_analysis = None
@@ -418,9 +568,12 @@ def main():
     layer_errors: list[str] = []  # 每层的测试报错信息，用于最后汇总
     consecutive_runtime_errors = 0
     conversation_thread_leaked = False
+    final_completeness: CompletenessResult | None = None
 
     for layer_idx in range(layer_count):
         consecutive_runtime_errors = 0
+        completeness_attempts = 0
+        last_missing_targets: tuple[str, ...] = ()
         prev_file_count = 0  # 记录上一轮的文件数，判断 LLM 是否在产出
         if trace_logger:
             trace_logger.set_context(layer_idx=layer_idx)
@@ -558,45 +711,96 @@ def main():
                     conv.send_message(msg)
                 continue
 
-            # ③ 检查当前层文件是否全部创建（每层只提醒一次）
-            if layers and round_idx == 1:
-                expected = set()
-                for lyr in layers[:layer_idx + 1]:
-                    for sf in lyr:
-                        expected.add(Path(sf).stem)
-                actual = set()
-                for ext in get_target_extensions(args.target_language):
-                    for p in Path(source_ws).rglob(f"*{ext}"):
-                        actual.add(p.stem)
-                missing = expected - actual
-                if missing:
-                    logger.info(f"  ⏩ {len(missing)} file(s) not translated (will be skipped)")
-                    conv.send_message(
-                        f"Translate these files before calling finish: "
-                        f"{', '.join(sorted(missing)[:5])}. "
-                        f"If you believe they are unnecessary, explain why."
+            # ③ LLM 调用了 finish → 先做翻译完整性检查，防止跳文件或缺失被测试掩盖
+            completeness = _check_translation_completeness(
+                source_ws,
+                layers,
+                translation_order,
+                layer_idx,
+                args.source_language,
+                args.target_language,
+            )
+            final_completeness = completeness
+            missing_targets = tuple(item.expected for item in completeness.missing)
+            if missing_targets:
+                if missing_targets == last_missing_targets:
+                    completeness_attempts += 1
+                else:
+                    completeness_attempts = 1
+                    last_missing_targets = missing_targets
+                logger.info(
+                    f"  ⚠️ Completeness check failed: "
+                    f"{completeness.present_count}/{completeness.expected_count} expected files present; "
+                    f"missing {len(completeness.missing)}"
+                )
+                for item in completeness.missing[:5]:
+                    logger.info(f"    missing: {item.source} -> {item.expected}")
+                if trace_logger:
+                    trace_logger.write("completeness_check", payload=_completeness_payload(
+                        completeness,
+                        layer_idx=layer_idx,
+                        attempt=completeness_attempts,
+                        retry_limit=completeness_retry_limit,
+                    ))
+                if completeness_attempts >= completeness_retry_limit:
+                    logger.warning(
+                        f"  ❌ Completeness check failed after {completeness_attempts} attempt(s); "
+                        "stopping to avoid infinite completion loop"
                     )
-                    conv.state.execution_status = ConversationExecutionStatus.RUNNING
-                    run_completed, thread_leaked = _run_conversation_with_timeout(conv, round_timeout)
-                    if thread_leaked:
-                        conversation_thread_leaked = True
-                        exit_reason = "stuck"
-                        break
-                    if not run_completed:
-                        exit_reason = "stuck"
-                        break
-                    continue
+                    exit_reason = "incomplete"
+                    break
+                conv.send_message(_format_completeness_feedback(
+                    completeness,
+                    completeness_attempts,
+                    completeness_retry_limit,
+                ))
+                if trace_logger:
+                    trace_logger.write("completeness_feedback_sent", payload={
+                        "layer": layer_idx,
+                        "attempt": completeness_attempts,
+                        "missing_count": len(completeness.missing),
+                    })
+                conv.state.execution_status = ConversationExecutionStatus.RUNNING
+                continue
+            completeness_attempts = 0
+            last_missing_targets = ()
+            logger.info(
+                f"  🧾 Completeness check passed: "
+                f"{completeness.present_count}/{completeness.expected_count} expected files present"
+            )
+            if trace_logger:
+                trace_logger.write("completeness_check", payload=_completeness_payload(
+                    completeness,
+                    layer_idx=layer_idx,
+                    attempt=0,
+                    retry_limit=completeness_retry_limit,
+                ))
 
-            # ④ LLM 调用了 finish → 跑测试验证这一层
+            # ④ 完整性通过 → 跑当前 workspace 的累计回归测试
             logger.info(f"  ✅ LLM finished layer. Running tests...")
             logger.info(f"  🧪 Analyzing test results...")
-            # 按层构建测试命令（支持 C++ 二进制 + Python pytest）
-            test_cmd = None
-            if test_layers and layer_idx < len(test_layers):
-                test_cmd = _build_layer_test_command(test_layers[layer_idx], source_ws)
+            # 每层执行当前 workspace 的累计回归测试；测试文件仍按层逐步复制。
+            new_layer_tests = test_layers[layer_idx] if test_layers and layer_idx < len(test_layers) else []
+            visible_tests = _collect_visible_test_files(test_layers, layer_idx)
+            test_cmd = _build_layer_test_command(visible_tests, source_ws)
+            test_scope = "cumulative_regression" if visible_tests else "auto_detected_regression"
+            if new_layer_tests:
+                logger.info(
+                    f"  🧪 Running cumulative regression tests with "
+                    f"{len(new_layer_tests)} newly assigned test file(s) "
+                    f"({len(visible_tests)} visible total)"
+                )
+            elif layers:
+                logger.info(
+                    "  🧪 No newly assigned tests for this layer; "
+                    "running cumulative regression tests"
+                )
             if trace_logger:
                 trace_logger.write("test_analysis_start", payload={
                     "layer": layer_idx,
+                    "test_scope": test_scope,
+                    "new_test_files": new_layer_tests,
+                    "visible_test_files": visible_tests,
                     "test_command": test_cmd if test_cmd else "auto-detected",
                 })
             try:
@@ -612,7 +816,7 @@ def main():
                 if analysis:
                     logger.info(f"  🔧 Compilation: "
                                 f"{'SUCCESS' if analysis.compilation.success else 'FAILED'}")
-                    layer_label = f"Layer {layer_idx}" if layer_count > 1 else "All"
+                    layer_label = f"Layer {layer_idx} regression" if layer_count > 1 else "All"
                     logger.info(f"  📊 {layer_label} tests: "
                                 f"{analysis.passed_tests}/{analysis.total_tests} "
                                 f"({analysis.overall_pass_rate:.1f}%)")
@@ -668,9 +872,10 @@ def main():
 
             # ④ 测试没全过 → 重置状态让 agent 继续修
             if final_analysis and final_analysis.total_tests == 0:
-                no_tests = True
-                exit_reason = "no_tests"
-                logger.info(f"  ✅ Agent finished (no tests to verify)")
+                if layer_idx == layer_count - 1:
+                    no_tests = True
+                    exit_reason = "no_tests"
+                logger.info(f"  ✅ Agent finished (no tests to verify at this layer)")
                 break
             conv.state.execution_status = ConversationExecutionStatus.RUNNING
 
@@ -694,6 +899,37 @@ def main():
             break
 
     total_elapsed = (datetime.now() - total_start).total_seconds()
+
+    if not conversation_thread_leaked and (layers or translation_order):
+        final_layer_idx = layer_count - 1
+        final_completeness = _check_translation_completeness(
+            source_ws,
+            layers,
+            translation_order,
+            final_layer_idx,
+            args.source_language,
+            args.target_language,
+        )
+        logger.info(
+            f"  🧾 Final completeness check: "
+            f"{final_completeness.present_count}/{final_completeness.expected_count} expected files present"
+        )
+        if trace_logger:
+            trace_logger.write("completeness_check", payload={
+                **_completeness_payload(
+                    final_completeness,
+                    layer_idx=final_layer_idx,
+                    attempt=0,
+                    retry_limit=completeness_retry_limit,
+                ),
+                "phase": "final",
+            })
+        if final_completeness.missing:
+            all_passed = False
+            exit_reason = "incomplete"
+            logger.warning("  ❌ Final completeness check failed; generated results are partial")
+            for item in final_completeness.missing[:10]:
+                logger.warning(f"    missing: {item.source} -> {item.expected}")
 
     if trace_logger:
         trace_logger.write("run_end", payload={

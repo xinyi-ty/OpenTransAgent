@@ -102,6 +102,14 @@ def test_dependency_layers_prompt_is_static_not_stale() -> None:
     assert "The runtime will announce which layer is currently unlocked" in prompt
 
 
+def test_prompt_mentions_edit_file_for_precise_fixes() -> None:
+    prompt = build_react_prompt("python", "cpp", "demo")
+
+    assert "## edit_file — Edit a workspace file by exact string replacement" in prompt
+    assert "use edit_file with an exact old_string/new_string replacement" in prompt
+    assert "Run focused checks when useful" in prompt
+
+
 def test_reflection_guidelines_match_tool_schema() -> None:
     prompt = build_react_prompt("python", "cpp", "demo")
 

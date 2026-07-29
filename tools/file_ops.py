@@ -178,6 +178,94 @@ class CreateFileTool(ToolDefinition):
 register_tool("create_file", CreateFileTool)
 
 
+class EditFileAction(Action):
+    filepath: str = Field(description="要修改的文件路径")
+    old_string: str = Field(description="要替换的精确原文；默认必须唯一")
+    new_string: str = Field(description="替换后的文本")
+    replace_all: bool = Field(default=False, description="是否替换所有匹配项")
+
+
+class EditFileObservation(Observation):
+    path: str = Field(default="")
+    replacements: int = Field(default=0)
+
+
+class EditFileExecutor(ToolExecutor):
+    def __init__(self, workspace_root: str = "."):
+        self.root = Path(workspace_root).resolve()
+
+    def __call__(self, action, conversation=None):
+        try:
+            p = _resolve_path(self.root, action.filepath)
+        except ValueError as e:
+            return EditFileObservation.from_text(
+                text=str(e), is_error=True, path=action.filepath, replacements=0,
+            )
+        rel = _to_rel(self.root, p)
+
+        ctrl = _get_layer_ctrl()
+        if ctrl and ctrl.active and not ctrl.is_unlocked(rel):
+            return EditFileObservation.from_text(
+                text=f"⛕ '{rel}' 属于更高依赖层，当前不可修改。先完成当前层所有文件并通过测试。",
+                is_error=True, path=rel, replacements=0,
+            )
+
+        if not p.exists() or not p.is_file():
+            return EditFileObservation.from_text(
+                text=f"文件不存在: {rel}", is_error=True, path=rel, replacements=0,
+            )
+        if action.old_string == action.new_string:
+            return EditFileObservation.from_text(
+                text="old_string 与 new_string 相同，无需修改", is_error=True,
+                path=rel, replacements=0,
+            )
+        if action.old_string == "":
+            return EditFileObservation.from_text(
+                text="old_string 不能为空", is_error=True, path=rel, replacements=0,
+            )
+
+        try:
+            content = _read_text(p)
+            count = content.count(action.old_string)
+            if count == 0:
+                return EditFileObservation.from_text(
+                    text=f"未找到 old_string: {rel}", is_error=True,
+                    path=rel, replacements=0,
+                )
+            if count > 1 and not action.replace_all:
+                return EditFileObservation.from_text(
+                    text=f"old_string 在 {rel} 中出现 {count} 次；请提供更精确上下文或设置 replace_all=true",
+                    is_error=True, path=rel, replacements=0,
+                )
+            new_content = content.replace(
+                action.old_string,
+                action.new_string,
+                -1 if action.replace_all else 1,
+            )
+            _atomic_write_text(p, new_content)
+            replacements = count if action.replace_all else 1
+            return EditFileObservation.from_text(
+                text=f"[OK] Edited file: {rel} ({replacements} replacement(s))",
+                path=rel, replacements=replacements,
+            )
+        except Exception as e:
+            return EditFileObservation.from_text(
+                text=f"修改文件失败: {e}", is_error=True, path=rel, replacements=0,
+            )
+
+
+class EditFileTool(ToolDefinition):
+    description: str = "Edit a workspace file by exact string replacement"
+
+    @classmethod
+    def create(cls, conv_state=None, **kwargs):
+        return [cls(action_type=EditFileAction, observation_type=EditFileObservation,
+                    executor=EditFileExecutor(workspace_root=kwargs.get("workspace_root", ".")))]
+
+
+register_tool("edit_file", EditFileTool)
+
+
 # ── list_files ──────────────────────────────────────────────────
 
 

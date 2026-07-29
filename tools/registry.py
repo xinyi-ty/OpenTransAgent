@@ -28,6 +28,7 @@ __all__ = [
 TOOL_DEFINITIONS: dict[str, str] = {
     "read_file": "Read a workspace file with safe path checks",
     "create_file": "Create/overwrite a workspace file atomically",
+    "edit_file": "Edit a workspace file by exact string replacement",
     "list_files": "List files and subdirectories in a workspace directory (non-recursive)",
     "execute_command": "Run shell commands (build, test, etc.)",
     "search_content": "Search keywords in project files",
