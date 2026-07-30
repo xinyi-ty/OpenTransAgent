@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "run_id": "Tencent_libco_cpp_to_python_20260729_213459_568250",
+  "project": "Tencent_libco",
+  "model": "openai/qwen3.7-plus",
+  "source_language": "cpp",
+  "target_language": "python",
+  "trace_file": "translation_trace.jsonl",
+  "summary_file": "translation_trace_summary.md",
+  "event_counts": {
+    "message_event": 5,
+    "run_start": 1,
+    "layer_start": 3,
+    "round_start": 4,
+    "llm_request": 92,
+    "llm_response": 92,
+    "action_event": 119,
+    "observation_event": 119,
+    "round_end": 4,
+    "completeness_check": 5,
+    "test_analysis_start": 4,
+    "test_analysis_result": 4,
+    "feedback_sent": 1,
+    "tool_advisory": 1,
+    "invalid_response": 1,
+    "layer_end": 1,
+    "run_end": 1
+  },
+  "advisory_counts": {
+    "full_rewrite_existing_file": 1
+  },
+  "warnings": [
+    "检测到无效响应: 1 次",
+    "执行翻译完整性检查: 5 次"
+  ]
+}

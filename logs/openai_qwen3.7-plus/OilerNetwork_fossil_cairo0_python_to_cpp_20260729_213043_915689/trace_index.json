@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "run_id": "OilerNetwork_fossil_cairo0_python_to_cpp_20260729_213043_915689",
+  "project": "OilerNetwork_fossil_cairo0",
+  "model": "openai/qwen3.7-plus",
+  "source_language": "python",
+  "target_language": "cpp",
+  "trace_file": "translation_trace.jsonl",
+  "summary_file": "translation_trace_summary.md",
+  "event_counts": {
+    "message_event": 1,
+    "run_start": 1,
+    "layer_start": 1,
+    "round_start": 1,
+    "llm_request": 12,
+    "llm_response": 12,
+    "action_event": 19,
+    "observation_event": 19,
+    "tool_advisory": 1,
+    "round_end": 1,
+    "completeness_check": 2,
+    "test_analysis_start": 1,
+    "test_analysis_result": 1,
+    "layer_end": 1,
+    "run_end": 1
+  },
+  "advisory_counts": {
+    "noncanonical_ctest_command": 1
+  },
+  "warnings": [
+    "执行翻译完整性检查: 2 次"
+  ]
+}

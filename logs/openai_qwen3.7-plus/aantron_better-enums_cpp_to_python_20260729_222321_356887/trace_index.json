@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "run_id": "aantron_better-enums_cpp_to_python_20260729_222321_356887",
+  "project": "aantron_better-enums",
+  "model": "openai/qwen3.7-plus",
+  "source_language": "cpp",
+  "target_language": "python",
+  "trace_file": "translation_trace.jsonl",
+  "summary_file": "translation_trace_summary.md",
+  "event_counts": {
+    "message_event": 4,
+    "run_start": 1,
+    "layer_start": 2,
+    "round_start": 3,
+    "llm_request": 66,
+    "llm_response": 66,
+    "action_event": 181,
+    "observation_event": 181,
+    "round_end": 3,
+    "completeness_check": 4,
+    "test_analysis_start": 2,
+    "test_analysis_result": 2,
+    "tool_advisory": 4,
+    "invalid_response": 1,
+    "completeness_feedback_sent": 1,
+    "layer_end": 1,
+    "run_end": 1
+  },
+  "advisory_counts": {
+    "previous_layer_full_rewrite_blocked": 1,
+    "full_rewrite_existing_file": 3
+  },
+  "warnings": [
+    "检测到无效响应: 1 次",
+    "执行翻译完整性检查: 4 次",
+    "发送完整性补齐反馈: 1 次"
+  ]
+}

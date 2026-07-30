@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "run_id": "spotify_pythonflow_python_to_cpp_20260729_202107_207264",
+  "project": "spotify_pythonflow",
+  "model": "openai/qwen3.7-plus",
+  "source_language": "python",
+  "target_language": "cpp",
+  "trace_file": "translation_trace.jsonl",
+  "summary_file": "translation_trace_summary.md",
+  "event_counts": {
+    "message_event": 10,
+    "run_start": 1,
+    "layer_start": 5,
+    "round_start": 10,
+    "llm_request": 169,
+    "llm_response": 169,
+    "action_event": 192,
+    "observation_event": 192,
+    "round_end": 10,
+    "completeness_check": 7,
+    "test_analysis_start": 5,
+    "test_analysis_result": 5,
+    "tool_advisory": 4,
+    "completeness_feedback_sent": 1,
+    "layer_end": 1,
+    "run_end": 1
+  },
+  "advisory_counts": {
+    "repeated_full_rewrite": 4
+  },
+  "warnings": [
+    "执行翻译完整性检查: 7 次",
+    "发送完整性补齐反馈: 1 次"
+  ]
+}

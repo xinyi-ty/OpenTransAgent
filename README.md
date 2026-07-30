@@ -26,6 +26,7 @@
 | 依赖 | 版本要求 | 用途 |
 | ------ | -------- | ------ |
 | Python | >= 3.12 | 运行环境 |
+| Git | 最新稳定版 | 获取代码；Windows 下同时提供 Git Bash |
 | uv（推荐）或 pip | 最新 | Python 包管理 |
 | OpenHands SDK | 通过 Python 依赖安装 | Agent / Conversation 运行时 |
 
@@ -38,30 +39,61 @@
 
 > 工具装好后请确认在系统 PATH 中。如果不在 PATH 中，可在 `.env` 中配置 `TOOLCHAIN_PATHS`。
 
-### 1. 安装 uv（推荐）
+### 1. 获取代码
 
 ```bash
-# Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+git clone <your-repo-url>
+cd OpenTransAgent
+```
 
+如果已经拿到压缩包，解压后进入项目根目录即可。
+
+### 2. 安装 uv（推荐）
+
+`uv` 是 Python 依赖和虚拟环境管理工具。本项目推荐用 `uv sync` 一次性创建环境并安装依赖。
+
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+```bash
 # macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 2. 安装 Python 依赖
+安装后验证：
 
 ```bash
-cd OpenTransAgent
+uv --version
+```
+
+### 3. 安装 Python 依赖
+
+推荐方式：
+
+```bash
 uv sync
 ```
 
-如使用 pip：
+如果不用 uv，也可以使用 pip：
 
 ```bash
+python -m venv .venv
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+# macOS / Linux: source .venv/bin/activate
 python -m pip install -e . pytest
 ```
 
-### 3. 配置 `.env`
+### 4. 配置 `.env`
+
+Windows PowerShell：
+
+```powershell
+Copy-Item .env.template .env
+```
+
+macOS / Linux / Git Bash：
 
 ```bash
 cp .env.template .env
@@ -86,7 +118,7 @@ REFLECTION_ENABLED=1
 TRACE_LOG_ENABLED=1
 ```
 
-### 4. 可选：启用拓扑排序
+### 5. 可选：启用拓扑排序
 
 ```env
 TOPO_SORT_PATH=D:\Code2Graph\file_topo_sort\topo_sort_files.py
@@ -94,7 +126,7 @@ TOPO_SORT_PATH=D:\Code2Graph\file_topo_sort\topo_sort_files.py
 
 如果未配置，程序会尝试自动检测 OpenTransAgent 同级目录下的 `Code2Graph/file_topo_sort/topo_sort_files.py`；检测失败则跳过拓扑排序，不中断翻译流程。
 
-### 5. 验证安装
+### 6. 验证安装
 
 ```bash
 python --version
@@ -102,9 +134,35 @@ uv run python -c "import openhands; print('SDK OK')"
 uv run python -m pytest -q
 ```
 
+如果使用 pip 环境，把上面的 `uv run python` 换成 `python`。
+
 ---
 
 ## 运行示例
+
+### 数据集目录约定
+
+推荐每个待测项目按下面结构放置：
+
+```text
+<dataset>/<project_name>/
+├── source_project/   # 源语言项目，传给 --source_path
+└── target_project/   # 可选：预构建测试/脚手架目录，程序会自动检测
+```
+
+当 `source_project` 的同级目录存在 `target_project` 时，程序会自动复制其中的测试文件和脚手架；也可以用 `--target_project_path` 显式指定。
+
+### Windows PowerShell 示例
+
+```powershell
+uv run python run.py `
+    --source_path "D:\organized_Python_C++\organized_Python_C++\Python_to_C++_organized\whonore_Coqtail\source_project" `
+    --target_path D:\target_space `
+    --source_language python `
+    --target_language cpp
+```
+
+### macOS / Linux / Git Bash 示例
 
 ```bash
 # C++ → Python
@@ -122,10 +180,18 @@ uv run python run.py \
     --project_name my_project
 ```
 
-输出默认写入：
+输出目录：
+
+- 如果指定 `--target_path D:\target_space`：输出到 `D:\target_space\<project_name>\`
+- 如果不指定 `--target_path`：输出到 `workspace/<project_name>/`
+
+工作区内部常见目录：
 
 ```text
-workspace/<project_name>/
+<output>/<project_name>/
+├── .source_staging/  # 完整源项目副本，LLM 不可见
+├── .source/          # 当前翻译/测试工作区
+└── ...               # 最终产物
 ```
 
 日志默认写入：
@@ -325,6 +391,18 @@ workspace/<project>/
 | 1 | 翻译完成但部分测试未通过，或无可验证测试 |
 | 2 | Agent 卡住 / 超时 |
 | 3 | 运行时异常 |
+
+---
+
+## 给测试同学的检查清单
+
+1. `python --version` 显示 3.12 或更高版本。
+2. `uv --version` 可正常输出；如果不用 uv，确认已激活虚拟环境。
+3. `cmake --version`、`g++ --version`、`make --version` 均可正常输出。
+4. 已复制 `.env.template` 为 `.env`，并填写 `LLM_MODEL`、`LLM_API_KEY`、`LLM_BASE_URL`。
+5. 已运行 `uv sync` 或 `python -m pip install -e . pytest`。
+6. 运行前确认 `source_project` 路径存在；如有配套测试，确认同级 `target_project` 存在，或通过 `--target_project_path` 指定。
+7. 运行结束后查看退出码和终端日志；详细排障查看 `logs/<model>/.../translation_trace.jsonl`。
 
 ---
 
