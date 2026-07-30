@@ -39,3 +39,4 @@ target_space/
 Thumbs.db
 .DS_Store
 nul
+.claude/

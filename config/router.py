@@ -26,6 +26,7 @@ class TranslationRoute:
     prompt_pair_instruction: str     # prompt 中的翻译对指引
     prompt_env_restriction: str      # prompt 中的环境限制
     file_extension_map: Callable[[str], str] | None = None  # 文件名映射规则（源→目标）
+    prompt_route_guidance: str = ""          # 语言对专属的翻译流程引导（仅 python→cpp 等需要特殊策略的对）
     explicit: bool = True            # 是否为显式注册的语言对
 
 
@@ -105,6 +106,14 @@ ROUTES: dict[tuple[str, str], TranslationRoute] = {
             "ctest --test-dir build --output-on-failure -C Release"
         ),
         file_extension_map=_py_to_cpp_ext,
+        prompt_route_guidance=(
+            "PYTHON TO C++ API CONTRACT STRATEGY:\n"
+            "- For layers with 5 or fewer source files, translate directly without a separate contract survey; read the source file and representative test, then create the .cpp/.h.\n"
+            "- For larger layers, before each batch of 3-4 files, begin by reading the relevant visible C++ test files to understand the expected API contract: class names, function signatures, constructor parameters, method names, namespaces, and header includes.\n"
+            "- Create matching .h and .cpp files that satisfy the test-expected API; do NOT invent different signatures, class names, or includes.\n"
+            "- After creating each batch, run a focused build (`cmake --build build --config Release --target translated_lib`) to catch API mismatches early.\n"
+            "- Adapt translated C++ source and header files to the contract; never modify tests or CMakeLists.txt to fit a mismatched translation."
+        ),
     ),
 }
 

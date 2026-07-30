@@ -231,6 +231,20 @@ def test_format_large_layer_guidance_only_for_large_layers() -> None:
     assert "more than 5 read_file/create_file/edit_file" in guidance
     assert "at most 3 representative test files" in guidance
     assert "do not cd into guessed external project paths" in guidance
+    assert "API contract" not in guidance
+
+
+def test_format_large_layer_guidance_api_contract_first() -> None:
+    guidance = _format_large_layer_guidance(
+        [f"f{i}.py" for i in range(6)],
+        route_strength="api_contract_first",
+    )
+
+    assert "Large layer batching rules" in guidance
+    assert "API contract" in guidance
+    assert "visible C++ test files" in guidance
+    assert "Match the test-expected API exactly" in guidance
+    assert "never modify tests or CMakeLists.txt" in guidance
 
 
 def test_format_required_targets_for_layer_lists_mapped_targets() -> None:

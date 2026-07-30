@@ -122,6 +122,9 @@ def test_python_to_cpp_prompt_mentions_cpp_target_guidelines() -> None:
     assert "public_tests/*, tests/*, or test/*" in prompt
     assert "PYTHON TARGET GUIDELINES:" not in prompt
     assert "Avoid fragile patterns like `sys.path.insert(0, '..')`" not in prompt
+    assert "API CONTRACT STRATEGY:" in prompt
+    assert "expected API contract" in prompt
+    assert "do NOT invent different" in prompt
 
 
 def test_cpp_to_python_prompt_mentions_python_target_guidelines_only() -> None:
@@ -135,6 +138,14 @@ def test_cpp_to_python_prompt_mentions_python_target_guidelines_only() -> None:
     assert "CPP TARGET GUIDELINES:" not in prompt
     assert "cmake --build build --config Release" not in prompt
     assert "CMakeLists.txt" not in prompt
+    assert "API CONTRACT STRATEGY:" not in prompt
+
+
+def test_generic_route_prompt_omits_api_contract_guidance() -> None:
+    prompt = build_react_prompt("java", "go", "demo")
+
+    assert "Your task is to translate a java project to go." in prompt
+    assert "API CONTRACT STRATEGY:" not in prompt
 
 
 def test_small_project_fast_path_is_added_for_five_or_fewer_files() -> None:

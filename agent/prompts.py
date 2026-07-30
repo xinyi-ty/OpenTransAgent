@@ -42,7 +42,7 @@ TRANSLATION GUIDELINES:
 5. Use edit_file for small, precise fixes to existing files; use create_file for new files or full rewrites.
 6. Run focused checks when useful, but do not rerun the same full test command unless relevant files changed. Once all expected files exist and tests pass, call finish immediately — do NOT spend extra steps verifying, listing, or re-running.
 7. execute_command already runs inside the translation workspace. Do NOT cd into guessed external project paths; use workspace-relative commands.
-8. Do not call think for layers with 5 or fewer source files unless a failure is ambiguous. If you know which file to inspect, call read_file directly; never respond with only a natural-language plan.{target_guidelines}{reflection_guidelines}"""
+8. Do not call think for layers with 5 or fewer source files unless a failure is ambiguous. If you know which file to inspect, call read_file directly; never respond with only a natural-language plan.{target_guidelines}{route_guidelines}{reflection_guidelines}"""
 
 PYTHON_TARGET_GUIDELINES = """
 
@@ -168,6 +168,13 @@ def _build_target_guidelines(target_language: str) -> str:
     return ""
 
 
+def _build_route_guidelines(route) -> str:
+    """提取语言对专属翻译流程引导，仅出现在显式路由中。"""
+    if route and route.prompt_route_guidance:
+        return "\n\n" + route.prompt_route_guidance
+    return ""
+
+
 def _build_small_project_fast_path_section(source_files: list[str]) -> str:
     """小项目快速路径提示，减少低价值探索和重复验证。"""
     _ = source_files
@@ -283,6 +290,7 @@ def build_react_prompt(
         GUIDELINES.format(
             pair_instruction=pair_instruction,
             target_guidelines=_build_target_guidelines(target_language),
+            route_guidelines=_build_route_guidelines(route),
             reflection_guidelines=reflection_guidelines,
         )
     )

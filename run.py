@@ -200,20 +200,44 @@ def _adaptive_steps_per_round(
     return base_steps
 
 
-def _format_large_layer_guidance(layer_files: list[str] | None) -> str:
-    """生成大层批处理提示，减少一次性读写/测试导致的长耗时。"""
+def _route_guidance_strength(source_language: str, target_language: str) -> str:
+    """提取当前语言对的 route 策略强度，供运行时提示使用。"""
+    route = get_effective_route(source_language, target_language)
+    if route and route.prompt_route_guidance:
+        return "api_contract_first"
+    return ""
+
+
+def _format_large_layer_guidance(
+    layer_files: list[str] | None,
+    route_strength: str = "",
+) -> str:
+    """生成大层批处理提示，减少一次性读写/测试导致的长耗时。
+    可选 route_strength 用于追加语言对专属策略提示。
+    """
     if len(layer_files or []) <= 5:
         return ""
-    return (
-        "\n\nLarge layer batching rules:"
-        "\n- Do not read every source file before writing; process at most 4 source files per batch."
-        "\n- Do not call more than 5 read_file/create_file/edit_file tools in one response."
-        "\n- Read at most 3 representative test files before generating target files; read more only after a concrete failure points to them."
-        "\n- Create missing target files before running broad tests."
-        "\n- Use one focused check while developing; run full regression only after all required target files exist."
-        "\n- execute_command already runs in the workspace; do not cd into guessed external project paths."
-        "\n- If a lower-layer file needs changes, use edit_file only; never full-rewrite it."
-    )
+    lines = [
+        "",
+        "Large layer batching rules:",
+        "- Do not read every source file before writing; process at most 4 source files per batch.",
+        "- Do not call more than 5 read_file/create_file/edit_file tools in one response.",
+        "- Read at most 3 representative test files before generating target files; read more only after a concrete failure points to them.",
+        "- Create missing target files before running broad tests.",
+        "- Use one focused check while developing; run full regression only after all required target files exist.",
+        "- execute_command already runs in the workspace; do not cd into guessed external project paths.",
+        "- If a lower-layer file needs changes, use edit_file only; never full-rewrite it.",
+    ]
+    if route_strength == "api_contract_first":
+        lines.extend([
+            "",
+            "This project has many visible C++ test files that define the expected API contract:",
+            "- Before generating target files, read at most 3 representative visible tests to understand required class/function signatures, namespaces, and header includes.",
+            "- Match the test-expected API exactly; do not invent different signatures or class names.",
+            "- After creating a batch of target files, run a focused build (`cmake --build build --config Release --target translated_lib`) to catch API mismatches early.",
+            "- Adapt translated C++ source/header files to the contract; never modify tests or CMakeLists.txt.",
+        ])
+    return "\n".join(lines) + "\n"
 
 
 def _collect_visible_test_files(
@@ -700,7 +724,7 @@ def main():
                    f"{', '.join(layers[layer_idx])}. "
                    f"These files depend on already-translated code."
                    f"{_format_required_targets_for_layer(layers[layer_idx], args.source_language, args.target_language)}"
-                   f"{_format_large_layer_guidance(layers[layer_idx])}")
+                   f"{_format_large_layer_guidance(layers[layer_idx], _route_guidance_strength(args.source_language, args.target_language))}")
             conv.send_message(msg)
 
         for round_idx in range(1, max_iter + 1):
@@ -800,7 +824,7 @@ def main():
                         "Round step budget was exhausted before this layer was complete. "
                         "Continue in small batches and create the missing required target files before running build/tests:\n"
                         f"{missing_lines}"
-                        f"{_format_large_layer_guidance(layer_files)}"
+                        f"{_format_large_layer_guidance(layer_files, _route_guidance_strength(args.source_language, args.target_language))}"
                     )
                     if trace_logger:
                         trace_logger.write("step_budget_completeness_check", payload={
@@ -814,7 +838,7 @@ def main():
                         "Do NOT continue broad self-testing or exploratory edits. Your next response should either "
                         "call finish so the runtime can run completeness and cumulative regression, or make one "
                         "minimal source edit only if the immediately previous build/test output identified a concrete error."
-                        f"{_format_large_layer_guidance(layer_files)}"
+                        f"{_format_large_layer_guidance(layer_files, _route_guidance_strength(args.source_language, args.target_language))}"
                     )
                 continue
             if status == ConversationExecutionStatus.PAUSED:
@@ -853,7 +877,7 @@ def main():
                            "translation with create_file. Do not spend steps exploring.")
                 else:
                     msg = "Continue working on the current layer. Call finish when all files are translated."
-                    msg += _format_large_layer_guidance(layer_files)
+                    msg += _format_large_layer_guidance(layer_files, _route_guidance_strength(args.source_language, args.target_language))
                 if trace_logger and idle_reason:
                     trace_logger.write("idle_nudge", payload={
                         "reason": idle_reason,

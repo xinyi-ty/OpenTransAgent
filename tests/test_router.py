@@ -72,6 +72,29 @@ def test_python_to_cpp_route_prefers_local_gtest_and_ctest() -> None:
     assert "auto-downloaded by FetchContent" not in text
 
 
+def test_python_to_cpp_route_has_api_contract_guidance() -> None:
+    route = get_route("python", "cpp")
+    assert route is not None
+    assert route.prompt_route_guidance != ""
+    assert "API CONTRACT" in route.prompt_route_guidance
+    assert "expected API contract" in route.prompt_route_guidance
+    assert "do NOT invent different" in route.prompt_route_guidance
+    assert "never modify tests" in route.prompt_route_guidance
+
+
+def test_cpp_to_python_route_has_empty_route_guidance() -> None:
+    route = get_route("cpp", "python")
+    assert route is not None
+    assert route.prompt_route_guidance == ""
+
+
+def test_generic_effective_route_has_empty_route_guidance() -> None:
+    route = get_effective_route("java", "go")
+    assert route is not None
+    assert route.explicit is False
+    assert route.prompt_route_guidance == ""
+
+
 def test_routes_are_frozen() -> None:
     route = get_route("cpp", "python")
     assert route is not None
